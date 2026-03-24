@@ -1,0 +1,17 @@
+# Environment secrets (API Keys live here,绝对不能提交！)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
