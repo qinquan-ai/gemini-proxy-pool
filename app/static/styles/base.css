@@ -1,0 +1,63 @@
+* { box-sizing: border-box; }
+
+html { font: 100%/1.5 var(--font-sans); }
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  letter-spacing: 0;
+  transition: background-color var(--duration) ease, color var(--duration) ease;
+}
+
+button, input { font: inherit; }
+button { color: inherit; }
+code { font-family: var(--font-mono); }
+
+:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: 2px;
+}
+
+.icon-button {
+  display: inline-grid;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  cursor: pointer;
+  font-size: 1.1rem;
+  transition: transform var(--duration-fast) var(--ease-out), background-color var(--duration-fast) ease, border-color var(--duration-fast) ease;
+}
+
+.icon-button:active { transform: scale(0.96); }
+.icon-button[aria-busy="true"] span { animation: spin 700ms linear infinite; }
+
+@media (hover: hover) and (pointer: fine) {
+  .icon-button:hover { background: var(--surface-raised); border-color: var(--line-strong); }
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :root { --surface: var(--surface-solid); --blur: 0px; }
+}
+
+@media (prefers-contrast: more) {
+  :root { --surface: var(--surface-solid); --line: var(--line-strong); }
+}

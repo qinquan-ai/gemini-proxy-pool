@@ -15,3 +15,19 @@ venv/
 # OS
 Thumbs.db
 .DS_Store
+
+# agent、skills
+.agents/
+.skills/
+
+# Local runtime logs
+logs/
+*.log
+
+# Test and visual QA artifacts (test source files remain tracked)
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.playwright-cli/

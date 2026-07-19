@@ -1,92 +1,58 @@
-# 🦞 Gemini Proxy Pool
+# Gemini Proxy Pool
 
-> Lightweight OpenAI-to-Gemini API proxy with automatic multi-key rotation, reactive 429 fallback, and function calling translation.
+A local-first OpenAI-to-Gemini gateway with multi-key round-robin routing, health cooldowns, error classification, streaming, function calling, multimodal inline data, and an operational dashboard.
 
-## ✨ Features
+## Scope
 
-| Feature | Description |
-|---------|-------------|
-| **Protocol Translation** | Seamlessly converts OpenAI API format to Google Gemini, enabling any OpenAI-compatible client to use Gemini models |
-| **Multi-Key Pool** | Round-robin load balancing across multiple Gemini API keys to maximize free-tier quota |
-| **Reactive 429 Fallback** | Automatically detects rate-limited keys, marks them for cooldown, and retries with the next healthy key — completely transparent to the client |
-| **Function Calling Bridge** | Bi-directional translation of OpenAI `tools` ↔ Gemini `functionDeclarations`, with schema sanitization to strip incompatible fields |
-| **Streaming (SSE)** | Full Server-Sent Events support for real-time token streaming |
-| **Health Dashboard** | `/v1/status` endpoint for monitoring pool health, per-key request counts, and cooldown timers |
+- Rotation is intended for legitimate multi-project capacity and failover.
+- Gemini quotas are enforced per Google Cloud Project. Multiple keys from one project do not create multiple quotas.
+- Text, function calls, base64 inline image/audio, and caller-provided Gemini File URIs are supported.
+- Long-video upload and the Files API job queue are not implemented yet.
+- Chat Completions and stateless Responses endpoints share the same key pool.
 
-## 🏗️ Architecture
+## Start
 
-```
-┌─────────────┐     OpenAI Format     ┌──────────────────┐     Gemini Format     ┌─────────────┐
-│  Any Client  │ ──────────────────▶  │  Gemini Proxy    │ ──────────────────▶   │  Google API  │
-│  (OpenClaw,  │                      │    Pool           │    Key Rotation       │  (Gemini 3   │
-│   Cursor,    │ ◀──────────────────  │                  │ ◀──────────────────   │   Flash)     │
-│   ChatBot)   │     OpenAI Format     │  localhost:8000  │     Gemini Format     │              │
-└─────────────┘                       └──────────────────┘                       └─────────────┘
-                                              │
-                                      ┌───────┴───────┐
-                                      │  KeyManager   │
-                                      │  ┌─Key 1 ✅─┐ │
-                                      │  ├─Key 2 ✅─┤ │
-                                      │  ├─Key 3 ⏳─┤ │  ← 429 Cooldown
-                                      │  └─Key 4 ✅─┘ │
-                                      └───────────────┘
-```
-
-## 🚀 Quick Start
-
-### 1. Install
-
-```bash
-git clone https://github.com/qinquan-ai/gemini-proxy-pool.git
-cd gemini-proxy-pool
-pip install fastapi uvicorn httpx python-dotenv
-```
-
-### 2. Configure Keys
-
-```bash
-cp .env.example .env
-# Edit .env and fill in your Gemini API keys
-```
-
-### 3. Run
-
-```bash
+```powershell
+python -m venv venv
+.\venv\Scripts\pip.exe install -r requirements.txt
+Copy-Item .env.example .env
 python main.py
 ```
 
-### 4. Use
+Open `http://127.0.0.1:8000` for the dashboard and use `http://127.0.0.1:8000/v1` as the OpenAI-compatible base URL.
 
-Point any OpenAI-compatible client to `http://localhost:8000/v1`:
+Available compatibility endpoints:
 
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3-flash-preview","messages":[{"role":"user","content":"Hello!"}]}'
+- `POST /v1/chat/completions`
+- `POST /v1/responses` (stateless; send full history)
+
+The Responses adapter supports function tools. OpenAI-hosted tools and
+`previous_response_id` storage are intentionally rejected instead of being silently ignored.
+
+Configure independent project keys:
+
+```env
+GEMINI_KEYS="account-1|AIzaSy...,account-2|AIzaSy...,account-3|AIzaSy...,account-4|AIzaSy..."
+GEMINI_DEFAULT_MODEL="gemini-2.5-flash"
+GEMINI_MODELS="gemini-2.5-flash,gemini-3-flash-preview"
 ```
 
-## 📊 Monitoring
+The server binds to `127.0.0.1` by default. Set a strong `PROXY_API_TOKEN` before changing `PROXY_HOST` to `0.0.0.0`.
 
-Visit `http://localhost:8000/v1/status`:
+## Offline tests
 
-```json
-{
-  "total_keys": 4,
-  "pool": [
-    { "name": "Primary",   "status": "Active",          "success_count": 142 },
-    { "name": "Secondary", "status": "Exhausted (429)", "cooldown_remaining_sec": 2847 }
-  ]
-}
+```powershell
+$env:PYTHONDONTWRITEBYTECODE="1"
+.\venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-## 🔧 API Endpoints
+`test_pool.py` is a live smoke test and consumes real quota.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat endpoint |
-| `GET`  | `/v1/models` | List available models |
-| `GET`  | `/v1/status` | Key pool health dashboard |
+## Next
 
-## 📜 License
+1. Gemini Files API video jobs with per-job key affinity
+2. An `analyze_video` MCP tool
+3. Per-model key health and quota state
+4. Persistent metrics
 
-MIT
+License: MIT

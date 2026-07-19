@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Gemini Key Pool</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231d1d1f'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='Arial' font-size='18' font-weight='700' fill='white'%3EG%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/assets/styles/tokens.css" />
+    <link rel="stylesheet" href="/assets/styles/base.css" />
+    <link rel="stylesheet" href="/assets/styles/dashboard.css" />
+    <script type="module" src="/assets/dashboard.js"></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="header-inner">
+        <div class="brand" aria-label="Gemini Key Pool">
+          <span class="brand-mark" aria-hidden="true">G</span>
+          <span>
+            <strong>Gemini Key Pool</strong>
+            <small>本地代理控制台</small>
+          </span>
+        </div>
+
+        <div class="header-actions">
+          <div class="connection" role="status" aria-live="polite">
+            <span id="health-dot" class="health-dot"></span>
+            <span id="health-text">正在连接</span>
+          </div>
+          <button id="refresh-button" class="icon-button" type="button" title="立即刷新" aria-label="立即刷新">
+            <span aria-hidden="true">&#8635;</span>
+          </button>
+          <button id="theme-button" class="icon-button" type="button" title="切换主题" aria-label="切换主题">
+            <span id="theme-icon" aria-hidden="true">&#9680;</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="overview" aria-labelledby="overview-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">运行概览</p>
+            <h1 id="overview-title">号池状态</h1>
+          </div>
+          <label class="switch-control">
+            <input id="auto-refresh" type="checkbox" checked />
+            <span class="switch-track" aria-hidden="true"><span></span></span>
+            <span>自动刷新</span>
+          </label>
+        </div>
+        <div id="summary" class="summary" aria-label="号池统计"></div>
+      </section>
+
+      <section class="pool-section" aria-labelledby="pool-title">
+        <div class="section-heading compact">
+          <div>
+            <h2 id="pool-title">Key 状态</h2>
+            <p id="model-info" class="supporting-text">正在读取模型配置</p>
+          </div>
+          <span id="updated-at" class="updated-at">尚未更新</span>
+        </div>
+
+        <div class="table-surface">
+          <div class="table-scroll" tabindex="0" aria-label="Key 状态表，可横向滚动">
+            <table>
+              <thead>
+                <tr>
+                  <th>名称</th><th>状态</th><th>Key</th>
+                  <th class="numeric">请求</th><th class="numeric">成功</th>
+                  <th class="numeric">失败</th><th class="numeric">429</th>
+                  <th class="numeric">在途</th><th class="numeric">冷却</th><th>最近错误</th>
+                </tr>
+              </thead>
+              <tbody id="pool-body">
+                <tr><td class="table-message" colspan="10">正在载入状态</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="pool-section integration-section" aria-labelledby="integration-title" style="margin-top: 2rem;">
+        <div class="section-heading compact">
+          <div>
+            <h2 id="integration-title">API 接入与配置指引</h2>
+            <p class="supporting-text">客户端快速配置参考</p>
+          </div>
+        </div>
+
+        <div class="table-surface" style="padding: 1.5rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem;">
+          <div class="card-guide" style="display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 1.2rem; box-shadow: var(--shadow-sm); color: var(--ink);">
+            <h3 style="margin-bottom: 0.8rem; font-size: 1.1rem; color: var(--accent);">🔗 接口信息</h3>
+            <div style="font-size: 0.9rem; line-height: 1.6; color: var(--muted);">
+              <p><strong>API Base URL:</strong> <code id="api-base-url" style="background: var(--surface-raised); border: 1px solid var(--line); padding: 2px 6px; border-radius: 4px; font-family: var(--font-mono); cursor: pointer; color: var(--accent);" onclick="navigator.clipboard.writeText('http://' + window.location.host + '/v1').then(() => alert('已复制 Base URL!'))">http://localhost:8000/v1</code> <span style="font-size:0.75rem; color:var(--subtle);">(点击复制)</span></p>
+              <p style="margin-top: 0.5rem;"><strong>API Key:</strong> <code style="background: var(--surface-raised); border: 1px solid var(--line); padding: 2px 6px; border-radius: 4px; font-family: var(--font-mono); color: var(--ink);">任意字符 / 可留空</code> (后端自动轮换实际密钥)</p>
+              <p style="margin-top: 0.5rem;"><strong>默认模型:</strong> <code id="guide-default-model" style="background: var(--surface-raised); border: 1px solid var(--line); padding: 2px 6px; border-radius: 4px; font-family: var(--font-mono); color: var(--ink);">正在读取...</code></p>
+              <p style="margin-top: 0.5rem;"><strong>可用模型:</strong> <code id="guide-available-models" style="background: var(--surface-raised); border: 1px solid var(--line); padding: 2px 6px; border-radius: 4px; font-family: var(--font-mono); color: var(--ink);">正在读取...</code></p>
+            </div>
+          </div>
+
+          <div class="card-guide" style="display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 1.2rem; box-shadow: var(--shadow-sm); color: var(--ink);">
+            <h3 style="margin-bottom: 0.8rem; font-size: 1.1rem; color: var(--accent);">🛠️ 常用客户端配置</h3>
+            <div style="font-size: 0.9rem; line-height: 1.6; color: var(--muted);">
+              <p><strong>Cursor:</strong></p>
+              <ul style="margin-left: 1.2rem; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.6rem; padding-left: 0.5rem;">
+                <li>在 Models 设置中添加并启用代理支持的 Gemini 模型。</li>
+                <li>启用 <code>Override OpenAI Base URL</code> 并填写 <code>http://localhost:8000/v1</code>。</li>
+              </ul>
+              <p style="margin-top: 0.5rem;"><strong>NextChat / LobeChat / Cherry Studio:</strong></p>
+              <ul style="margin-left: 1.2rem; font-size: 0.85rem; color: var(--muted); padding-left: 0.5rem;">
+                <li>服务商选择 <code>OpenAI</code> 或 <code>自定义/OneAPI</code> 模式。</li>
+                <li>接口地址 (Base URL) 填 <code>http://localhost:8000/v1</code>。</li>
+                <li>API Key 填任意内容即可（如 <code>sk-gemini</code>）。</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="card-guide" style="display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 1.2rem; box-shadow: var(--shadow-sm); color: var(--ink);">
+            <h3 style="margin-bottom: 0.8rem; font-size: 1.1rem; color: var(--accent);">💻 终端测试指令</h3>
+            <p style="font-size: 0.8rem; color: var(--muted); margin-bottom: 0.3rem;"><strong>PowerShell (Windows):</strong></p>
+            <pre style="background: var(--surface-raised); border: 1px solid var(--line); padding: 0.6rem; border-radius: 6px; font-family: var(--font-mono); font-size: 0.75rem; white-space: pre-wrap; word-break: break-all; color: var(--ink); margin-bottom: 0.8rem; cursor: pointer;" onclick="navigator.clipboard.writeText(this.textContent).then(() => alert('已复制 PowerShell 测试命令!'))">Invoke-RestMethod -Uri http://localhost:8000/v1/chat/completions -Method Post -ContentType "application/json" -Body '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"你好"}]}'</pre>
+            <p style="font-size: 0.8rem; color: var(--muted); margin-bottom: 0.3rem;"><strong>Bash (Linux/Mac/Git Bash):</strong></p>
+            <pre style="background: var(--surface-raised); border: 1px solid var(--line); padding: 0.6rem; border-radius: 6px; font-family: var(--font-mono); font-size: 0.75rem; white-space: pre-wrap; word-break: break-all; color: var(--ink); margin: 0; cursor: pointer;" onclick="navigator.clipboard.writeText(this.textContent).then(() => alert('已复制 Bash 测试命令!'))">curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"你好"}]}'</pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+
+    <footer class="app-footer">
+      <span>数据来自 <code>/v1/status</code></span>
+      <span>Key 仅显示脱敏前缀</span>
+    </footer>
+  </body>
+</html>
