@@ -6,12 +6,12 @@ import re
 import time
 import uuid
 import traceback
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
@@ -22,7 +22,10 @@ from app.core.responses_adapter import (
     responses_to_chat_request,
     sse_event,
 )
+from app.core.thought_signatures import thought_signature_store
 from app.core.translator import openai_to_gemini, translate_tools
+from app.core.video_analysis import VideoAnalysisService
+from app.mcp_server import configure_video_service, mcp
 
 load_dotenv()
 
@@ -33,7 +36,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-DEFAULT_MODEL = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-3-flash-preview")
 AVAILABLE_MODELS = [
     model.strip()
     for model in os.getenv("GEMINI_MODELS", DEFAULT_MODEL).split(",")
@@ -46,6 +49,9 @@ PERMISSION_COOLDOWN_SECONDS = int(
     os.getenv("PERMISSION_COOLDOWN_SECONDS", "300")
 )
 MODEL_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+NATIVE_GEMINI_PATH_PATTERN = re.compile(
+    r"^models(?:/[A-Za-z0-9._-]+(?::(?:generateContent|streamGenerateContent|countTokens))?)?$"
+)
 
 
 @asynccontextmanager
@@ -60,15 +66,22 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 GEMINI PROXY POOL ACTIVE")
     logger.info("👉 Local Dashboard: http://localhost:8000")
     logger.info("👉 Health Status:   http://localhost:8000/v1/status")
+    logger.info("👉 Video MCP:      http://localhost:8000/mcp/")
     logger.info("=" * 60)
     print()
-    yield
+    app.state.video_service = VideoAnalysisService(key_pool, app.state.http_client)
+    configure_video_service(app.state.video_service)
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(mcp.session_manager.run())
+        yield
+    await app.state.video_service.shutdown()
     await app.state.http_client.aclose()
 
 
-app = FastAPI(title="Gemini Proxy Pool", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Gemini Proxy Pool", version="0.7.2", lifespan=lifespan)
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
+app.mount("/mcp", mcp.streamable_http_app())
 
 allowed_origins = [
     origin.strip()
@@ -243,9 +256,16 @@ def extract_response_parts(data: dict) -> tuple[list[str], list[dict], str]:
             )
         if "functionCall" in part:
             function_call = part["functionCall"]
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            thought_signature_store.remember(
+                call_id,
+                function_call.get("name", ""),
+                function_call.get("args", {}),
+                part.get("thoughtSignature", ""),
+            )
             tool_calls.append(
                 {
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "id": call_id,
                     "type": "function",
                     "function": {
                         "name": function_call.get("name", ""),
@@ -258,6 +278,170 @@ def extract_response_parts(data: dict) -> tuple[list[str], list[dict], str]:
     return text_chunks, tool_calls, finish_reason
 
 
+def usage_metadata_from_payload(data: dict) -> dict:
+    usage = data.get("usageMetadata", {}) if isinstance(data, dict) else {}
+    return usage if isinstance(usage, dict) else {}
+
+
+def usage_metadata_from_sse_tail(content: bytes) -> dict:
+    latest = {}
+    for line in content.decode("utf-8", errors="ignore").splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[5:].strip())
+        except ValueError:
+            continue
+        usage = usage_metadata_from_payload(payload)
+        if usage:
+            latest = usage
+    return latest
+
+
+def is_allowed_native_gemini_path(path: str) -> bool:
+    return bool(NATIVE_GEMINI_PATH_PATTERN.fullmatch(path))
+
+
+def native_gemini_headers(request: Request, api_key: str) -> dict[str, str]:
+    headers = {"x-goog-api-key": api_key}
+    for name in ("accept", "content-type", "user-agent", "x-goog-api-client"):
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+    return headers
+
+
+def native_google_error(message: str, status_code: int = 503) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": status_code,
+                "message": message,
+                "status": "UNAVAILABLE" if status_code == 503 else "UNKNOWN",
+            }
+        },
+    )
+
+
+@app.api_route(
+    "/v1beta/{google_path:path}", methods=["GET", "POST", "DELETE", "PATCH"]
+)
+async def native_gemini_gateway(google_path: str, request: Request):
+    if not is_allowed_native_gemini_path(google_path):
+        return native_google_error("Unsupported native Gemini endpoint", 404)
+
+    body = await request.body()
+    target = f"https://generativelanguage.googleapis.com/v1beta/{google_path}"
+    is_stream = "streamGenerateContent" in google_path
+
+    for attempt in range(max(1, len(key_pool.keys))):
+        key_info = key_pool.acquire_key()
+        if not key_info:
+            break
+        api_key = key_info["key"]
+        finalized = False
+        try:
+            upstream_request = request.app.state.http_client.build_request(
+                request.method,
+                target,
+                params=list(request.query_params.multi_items()),
+                headers=native_gemini_headers(request, api_key),
+                content=body,
+            )
+            if is_stream:
+                upstream = await request.app.state.http_client.send(
+                    upstream_request, stream=True
+                )
+                if upstream.status_code >= 400:
+                    error_body = await upstream.aread()
+                    message = google_error_message(upstream, error_body)
+                    action = finalize_failed_response(api_key, upstream, message)
+                    finalized = True
+                    await upstream.aclose()
+                    if action == "retry":
+                        continue
+                    return Response(
+                        content=error_body,
+                        status_code=upstream.status_code,
+                        media_type=upstream.headers.get("content-type"),
+                    )
+
+                async def stream_body():
+                    stream_finalized = False
+                    usage_tail = b""
+                    try:
+                        async for chunk in upstream.aiter_raw():
+                            usage_tail = (usage_tail + chunk)[-262_144:]
+                            yield chunk
+                        key_pool.mark_success(
+                            api_key, usage_metadata_from_sse_tail(usage_tail)
+                        )
+                        stream_finalized = True
+                    except (httpx.HTTPError, OSError) as exc:
+                        key_pool.mark_failure(
+                            api_key,
+                            reason=f"Native stream transport error: {exc}",
+                            cooldown_seconds=key_pool.transient_cooldown,
+                        )
+                        stream_finalized = True
+                        raise
+                    finally:
+                        await upstream.aclose()
+                        if not stream_finalized:
+                            key_pool.release(api_key)
+
+                finalized = True
+                return StreamingResponse(
+                    stream_body(),
+                    status_code=upstream.status_code,
+                    media_type=upstream.headers.get("content-type"),
+                )
+
+            upstream = await request.app.state.http_client.send(upstream_request)
+            if upstream.status_code >= 400:
+                message = google_error_message(upstream)
+                action = finalize_failed_response(api_key, upstream, message)
+                finalized = True
+                if action == "retry":
+                    continue
+                return Response(
+                    content=upstream.content,
+                    status_code=upstream.status_code,
+                    media_type=upstream.headers.get("content-type"),
+                )
+            try:
+                usage = usage_metadata_from_payload(upstream.json())
+            except ValueError:
+                usage = {}
+            key_pool.mark_success(api_key, usage)
+            finalized = True
+            return Response(
+                content=upstream.content,
+                status_code=upstream.status_code,
+                media_type=upstream.headers.get("content-type"),
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            if not finalized:
+                key_pool.mark_failure(
+                    api_key,
+                    reason=f"Native gateway transport error: {exc}",
+                    cooldown_seconds=key_pool.transient_cooldown,
+                )
+                finalized = True
+            logger.warning(
+                "Native Gemini attempt %d failed for %s: %s",
+                attempt + 1,
+                key_info["name"],
+                exc,
+            )
+        finally:
+            if not finalized:
+                key_pool.release(api_key)
+
+    return native_google_error("No healthy API key is available")
+
+
 @app.get("/", response_class=FileResponse)
 async def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
@@ -266,11 +450,15 @@ async def index():
 @app.get("/healthz")
 async def healthz():
     status = key_pool.get_status()
+    video_service = getattr(app.state, "video_service", None)
     return {
         "status": "ok" if status["available_keys"] else "degraded",
+        "version": app.version,
         "available_keys": status["available_keys"],
         "total_keys": status["total_keys"],
         "default_model": DEFAULT_MODEL,
+        "mcp_endpoint": "/mcp/",
+        "video_jobs": len(video_service.jobs) if video_service else 0,
     }
 
 
@@ -292,6 +480,40 @@ async def get_status():
     status["default_model"] = DEFAULT_MODEL
     status["models"] = AVAILABLE_MODELS
     status["auth_enabled"] = bool(PROXY_API_TOKEN)
+    video_service = getattr(app.state, "video_service", None)
+    jobs = list(video_service.jobs.values()) if video_service else []
+    status["mcp_endpoint"] = "/mcp/"
+    status["video_jobs"] = {
+        "total": len(jobs),
+        "running": sum(job.status in {"queued", "running"} for job in jobs),
+        "completed": sum(job.status == "completed" for job in jobs),
+        "failed": sum(job.status == "failed" for job in jobs),
+    }
+    status["supported_video_sources"] = [
+        "YouTube",
+        "抖音",
+        "哔哩哔哩",
+        "公开网页",
+        "本地文件",
+    ]
+    status["recent_video_jobs"] = [
+        {
+            "id": job.id,
+            "status": job.status,
+            "stage": job.stage,
+            "progress": round(job.progress, 3),
+            "analysis_type": job.analysis_type,
+            "source_type": job.source_type,
+            "title": (job.source_metadata or {}).get("title"),
+            "duration": (job.source_metadata or {}).get("duration"),
+            "model": job.model,
+            "key_name": job.key_name,
+            "error": job.error,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+        }
+        for job in sorted(jobs, key=lambda item: item.updated_at, reverse=True)[:8]
+    ]
     return JSONResponse(content=status)
 
 
@@ -422,6 +644,7 @@ async def stream_with_retry(
 
         api_key = key_info["key"]
         finalized = False
+        usage = {}
         try:
             url = f"{base_url}:streamGenerateContent?alt=sse"
             async with client.stream(
@@ -451,6 +674,9 @@ async def stream_with_retry(
                         data = json.loads(line[6:])
                     except ValueError:
                         continue
+                    chunk_usage = usage_metadata_from_payload(data)
+                    if chunk_usage:
+                        usage = chunk_usage
                     text_chunks, tool_calls, _ = extract_response_parts(data)
                     if text_chunks:
                         yield _sse_chunk(
@@ -468,7 +694,7 @@ async def stream_with_retry(
                             "tool_calls",
                         )
 
-                key_pool.mark_success(api_key)
+                key_pool.mark_success(api_key, usage)
                 finalized = True
                 yield _sse_chunk(chat_id, created_at, model, {}, "stop")
                 yield "data: [DONE]\n\n"
@@ -722,14 +948,14 @@ async def complete_with_retry(
 
             data = response.json()
             text_chunks, tool_calls, finish_reason = extract_response_parts(data)
-            key_pool.mark_success(api_key)
+            usage = usage_metadata_from_payload(data)
+            key_pool.mark_success(api_key, usage)
             finalized = True
 
             message = {"role": "assistant", "content": "".join(text_chunks) or None}
             if tool_calls:
                 message["tool_calls"] = tool_calls
 
-            usage = data.get("usageMetadata", {})
             return JSONResponse(
                 content={
                     "id": chat_id,

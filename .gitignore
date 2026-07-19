@@ -20,6 +20,9 @@ Thumbs.db
 .agents/
 .skills/
 
+# docs
+docs/
+
 # Local runtime logs
 logs/
 *.log
@@ -31,3 +34,9 @@ logs/
 coverage.xml
 htmlcov/
 .playwright-cli/
+data/video_jobs/
+data/video_downloads/
+data/key_pool_state.json
+data/backlog/
+data/*.mp4
+

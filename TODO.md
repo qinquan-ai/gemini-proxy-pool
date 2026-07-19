@@ -8,8 +8,12 @@
 - [x] **Multi-Key Rotation:** Thread-safe round-robin with health state and in-flight counters.
 - [x] **Error Handling & Fallback:** 429 retry delay, auth handling, transient cooldown, and correct 4xx behavior.
 - [x] **Offline Testing:** Key manager, translator, API helpers, and dashboard endpoints.
+- [x] **Video MCP:** Files API upload, processing poll, same-key job affinity, structured analysis, and background job tools.
+- [x] **Douyin online sources:** Share-text parsing, yt-dlp resolution, isolated browser fallback, and verified temporary media cleanup.
+- [x] **Bilibili and generic pages:** Merged A/V downloads, browser media fallback, redirect limits, and private-network URL blocking.
+- [x] **Gateway autostart:** Current-user Windows scheduled task with a single-instance health check.
 - [ ] **Client Integration:** Verify with AGY/OpenClaw through the custom provider settings.
-- [ ] **Video Jobs:** Files API upload, processing poll, job affinity, and structured analysis output.
+- [ ] **Native MCP Tasks:** Replace compatibility polling tools with negotiated MCP Tasks when target clients support the extension.
 
 ## Phase 2: Antigravity OAuth Integration (Advanced)
 **Goal:** Evaluate supported OAuth integrations separately from the Gemini Developer API key pool.

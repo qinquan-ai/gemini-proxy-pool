@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from app.core.key_manager import KeyManager
 
@@ -59,6 +62,44 @@ class KeyManagerTests(unittest.TestCase):
         self.assertEqual(status["in_flight"], 0)
         self.assertEqual(status["total_successes"], 1)
         self.assertEqual(status["success_rate"], 100.0)
+
+    def test_usage_and_health_state_survive_restart_without_storing_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "key-pool.json"
+            first = KeyManager(
+                keys_value="primary|secret-api-key",
+                clock=self.clock,
+                state_file=state_file,
+            )
+            selected = first.acquire_key()
+            first.mark_success(
+                selected["key"],
+                {
+                    "promptTokenCount": 120,
+                    "candidatesTokenCount": 30,
+                    "thoughtsTokenCount": 40,
+                    "totalTokenCount": 150,
+                    "cachedContentTokenCount": 20,
+                },
+            )
+
+            persisted_text = state_file.read_text(encoding="utf-8")
+            self.assertNotIn("secret-api-key", persisted_text)
+            self.assertEqual(json.loads(persisted_text)["version"], 1)
+
+            restored = KeyManager(
+                keys_value="primary|secret-api-key",
+                clock=self.clock,
+                state_file=state_file,
+            ).get_status()
+            self.assertEqual(restored["total_requests"], 1)
+            self.assertEqual(restored["total_successes"], 1)
+            self.assertEqual(restored["input_tokens"], 120)
+            self.assertEqual(restored["output_tokens"], 30)
+            self.assertEqual(restored["thought_tokens"], 40)
+            self.assertEqual(restored["total_tokens"], 150)
+            self.assertEqual(restored["cached_tokens"], 20)
+            self.assertEqual(restored["in_flight"], 0)
 
 
 if __name__ == "__main__":

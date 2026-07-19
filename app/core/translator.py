@@ -1,6 +1,8 @@
 import json
 import re
 
+from app.core.thought_signatures import thought_signature_store
+
 
 DATA_URL_PATTERN = re.compile(
     r"^data:(?P<mime>[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+);base64,(?P<data>.+)$",
@@ -167,7 +169,15 @@ def openai_to_gemini(openai_messages: list) -> tuple:
                         args = json.loads(fn.get("arguments", "{}")) if isinstance(fn.get("arguments"), str) else fn.get("arguments", {})
                     except:
                         args = {}
-                    parts.append({"functionCall": {"name": fn.get("name", ""), "args": args}})
+                    function_part = {
+                        "functionCall": {"name": fn.get("name", ""), "args": args}
+                    }
+                    signature = thought_signature_store.resolve(
+                        tc.get("id", ""), fn.get("name", ""), args
+                    )
+                    if signature:
+                        function_part["thoughtSignature"] = signature
+                    parts.append(function_part)
             if parts:
                 contents.append({"role": "model", "parts": parts})
             continue
