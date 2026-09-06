@@ -8,9 +8,11 @@ from app.core.video_analysis import VideoAnalysisError, VideoAnalysisService
 mcp = FastMCP(
     "StudioKey Video Analysis",
     instructions=(
-        "Analyze public YouTube or Douyin links, pasted Douyin share text, and "
-        "local files with the shared StudioKey Gemini pool. Return structured "
-        "Remotion-ready visual and audio evidence."
+        "Analyze public YouTube, Douyin, Bilibili links, pasted share text, and "
+        "local video files with the shared StudioKey Gemini pool. "
+        "Default mode 'general' provides objective audiovisual and narrative analysis. "
+        "Modes: 'general' (default content analysis), 'curation' (short drama/video repurposing and watermark scoring), "
+        "'remotion' (Remotion React component plan), 'vox', 'vlog', 'technical', 'transcript'."
     ),
     stateless_http=True,
     json_response=True,
@@ -33,11 +35,11 @@ def get_video_service() -> VideoAnalysisService:
 @mcp.tool()
 async def submit_video_analysis(
     source: str,
-    analysis_type: str = "remotion",
+    analysis_type: str = "general",
     prompt: str | None = None,
-    model: str = "gemini-3-flash-preview",
+    model: str = "gemini-3.5-flash-lite",
 ) -> dict:
-    """Submit YouTube/Douyin share text, a URL, or a local file for analysis."""
+    """Submit YouTube/Douyin/Bilibili share text, a URL, or a local file for analysis."""
     try:
         return await get_video_service().submit(source, analysis_type, prompt, model)
     except VideoAnalysisError as exc:
@@ -65,9 +67,9 @@ async def cancel_video_analysis(job_id: str) -> dict:
 @mcp.tool()
 async def analyze_video(
     source: str,
-    analysis_type: str = "remotion",
+    analysis_type: str = "general",
     prompt: str | None = None,
-    model: str = "gemini-3-flash-preview",
+    model: str = "gemini-3.5-flash-lite",
     timeout_seconds: float = 900,
     ctx: Context | None = None,
 ) -> dict:
@@ -101,4 +103,59 @@ def video_analysis_capabilities() -> str:
         "or complete pasted Douyin share text, Gemini Files API URIs, and gs:// "
         "URIs. Modes: remotion, vox, vlog, technical, transcript, general. "
         "Background jobs and completed results are persisted."
+    )
+
+
+@mcp.tool()
+async def generate_image(
+    prompt: str,
+    image_name: str = "generated_image",
+    aspect_ratio: str = "1:1",
+    output_path: str | None = None,
+    image_paths: list[str] | str | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Generate high-quality images or edit based on reference images using Google Imagen 4.0 via AGY engine.
+
+    Args:
+        prompt: Detailed visual description or editing instructions.
+        image_name: Short identifier name for the image (lowercase_with_underscores).
+        aspect_ratio: Aspect ratio of the generated image. Supported values: '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'. Default is '1:1'.
+        output_path: Optional local destination file path to save the generated image.
+        image_paths: Optional list of reference/input image paths (max 3) for image-to-image, style transfer, or editing.
+    """
+    from app.core.agy_image_generator import generate_image_async
+
+    if ctx:
+        await ctx.info(f"Generating image with prompt: {prompt[:60]}...")
+    return await generate_image_async(
+        prompt=prompt,
+        image_name=image_name,
+        aspect_ratio=aspect_ratio,
+        output_path=output_path,
+        image_paths=image_paths,
+    )
+
+
+@mcp.tool()
+async def analyze_image(
+    image_path: list[str] | str,
+    prompt: str = "请详细分析并描述这张图片的内容。",
+    ctx: Context | None = None,
+) -> dict:
+    """Analyze local image(s) using Antigravity (AGY) multimodal vision engine.
+    Supports UI component breakdown, design extraction, OCR text recognition, bug/error screenshot diagnosis, and visual question answering.
+
+    Args:
+        image_path: Absolute or relative local path to the image file (or list of paths). Supported: JPG, PNG, WEBP, GIF, BMP.
+        prompt: Analysis requirements (e.g., 'Break down this UI layout into React components', 'Extract all text from this screenshot', 'Diagnose what caused this error').
+    """
+    from app.core.agy_image_analyzer import analyze_image_async
+
+    path_display = image_path if isinstance(image_path, str) else ", ".join(image_path[:2])
+    if ctx:
+        await ctx.info(f"Analyzing image ({path_display}) with AGY engine...")
+    return await analyze_image_async(
+        image_path=image_path,
+        prompt=prompt,
     )

@@ -53,6 +53,20 @@ NATIVE_GEMINI_PATH_PATTERN = re.compile(
     r"^models(?:/[A-Za-z0-9._-]+(?::(?:generateContent|streamGenerateContent|countTokens))?)?$"
 )
 
+def _sanitize_no_proxy():
+    """Sanitize NO_PROXY environment variables to strip out IPv6 entries like ::1 that crash httpx's URLPattern parser."""
+    for var in ("NO_PROXY", "no_proxy"):
+        val = os.environ.get(var)
+        if val:
+            clean_entries = [
+                item.strip()
+                for item in val.split(",")
+                if item.strip() and ":" not in item
+            ]
+            os.environ[var] = ",".join(clean_entries)
+
+_sanitize_no_proxy()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

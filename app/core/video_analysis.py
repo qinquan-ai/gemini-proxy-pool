@@ -5,11 +5,14 @@ import os
 import shutil
 import time
 import uuid
+import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from app.core.key_manager import KeyManager
 from app.core.video_sources import VideoSource, parse_video_source, validate_public_url
@@ -25,9 +28,101 @@ SUPPORTED_VIDEO_MIME_TYPES = {
     "video/x-ms-wmv",
     "video/3gpp",
 }
-ANALYSIS_TYPES = {"remotion", "vox", "vlog", "technical", "transcript", "general"}
+ANALYSIS_TYPES = {"general", "curation", "remotion", "vox", "vlog", "technical", "transcript"}
 
-ANALYSIS_SCHEMA = {
+GENERAL_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "content_type": {"type": "string"},
+        "language": {"type": "string"},
+        "main_topics": {"type": "array", "items": {"type": "string"}},
+        "visual_description": {"type": "string"},
+        "audio_description": {"type": "string"},
+        "timeline": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "visual": {"type": "string"},
+                    "audio": {"type": "string"},
+                    "caption": {"type": "string"},
+                },
+                "required": ["start", "end", "visual"],
+            },
+        },
+        "confidence_notes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "visual_description", "audio_description", "timeline"],
+}
+
+CURATION_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "plot_and_characters": {
+            "type": "object",
+            "properties": {
+                "main_plot": {"type": "string"},
+                "key_characters": {"type": "array", "items": {"type": "string"}},
+                "conflict_and_twists": {"type": "string"},
+                "emotional_hook": {"type": "string"},
+            },
+            "required": ["main_plot", "conflict_and_twists"],
+        },
+        "watermark_and_quality": {
+            "type": "object",
+            "properties": {
+                "has_platform_watermark": {"type": "boolean"},
+                "has_author_watermark": {"type": "boolean"},
+                "watermark_details": {"type": "string"},
+                "subtitle_obstruction": {"type": "string"},
+                "visual_clarity": {"type": "string"},
+                "audio_clarity": {"type": "string"},
+                "flaws_or_policy_risks": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["has_platform_watermark", "has_author_watermark", "visual_clarity"],
+        },
+        "tiktok_potential": {
+            "type": "object",
+            "properties": {
+                "opening_hook_score": {"type": "integer"},
+                "hook_description": {"type": "string"},
+                "climax_timestamp": {"type": "string"},
+                "suggested_english_title": {"type": "string"},
+                "recommended_tags": {"type": "array", "items": {"type": "string"}},
+                "curation_score": {"type": "number"},
+                "curation_recommendation": {"type": "string"},
+            },
+            "required": ["curation_score", "curation_recommendation"],
+        },
+        "timeline": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "visual": {"type": "string"},
+                    "audio": {"type": "string"},
+                    "caption": {"type": "string"},
+                },
+                "required": ["start", "end", "visual"],
+            },
+        },
+    },
+    "required": [
+        "summary",
+        "plot_and_characters",
+        "watermark_and_quality",
+        "tiktok_potential",
+        "timeline",
+    ],
+}
+
+REMOTION_ANALYSIS_SCHEMA = {
     "type": "object",
     "properties": {
         "summary": {"type": "string"},
@@ -82,13 +177,17 @@ ANALYSIS_SCHEMA = {
     "required": ["summary", "timeline", "reusable_patterns", "remotion_plan"],
 }
 
+# Alias for backwards compatibility
+ANALYSIS_SCHEMA = REMOTION_ANALYSIS_SCHEMA
+
 STYLE_INSTRUCTIONS = {
-    "remotion": "Prioritize timing, reusable React components, assets, typography, transitions, and implementation difficulty.",
+    "general": "Provide an objective, comprehensive audio-visual and narrative analysis of the content without assuming any code generation or Remotion intent.",
+    "curation": "Analyze for short drama/video repurposing and curation (e.g. TikTok/Shorts). Focus on opening hook (0-3s), plot twists, character conflicts, watermark presence, visual/audio clarity, and provide a 1-10 curation score.",
+    "remotion": "Prioritize timing, reusable React components, assets, typography, transitions, and Remotion implementation difficulty.",
     "vox": "Prioritize editorial structure, evidence reveals, maps, charts, kinetic typography, and VOX-style pacing.",
     "vlog": "Prioritize story beats, A-roll/B-roll, jump cuts, captions, music, ambience, and reusable creator effects.",
     "technical": "Prioritize teaching structure, screen recordings, code emphasis, diagrams, callouts, and information density.",
     "transcript": "Prioritize timestamped speech, speaker changes, on-screen text, and visible event synchronization.",
-    "general": "Provide a balanced audio-visual and narrative analysis.",
 }
 
 
@@ -167,7 +266,7 @@ class VideoAnalysisService:
         ).strip()
         self._load_jobs()
 
-    async def submit(self, source: str, analysis_type: str = "remotion", prompt: str | None = None, model: str = "gemini-3-flash-preview") -> dict:
+    async def submit(self, source: str, analysis_type: str = "general", prompt: str | None = None, model: str = "gemini-3.5-flash-lite") -> dict:
         if analysis_type not in ANALYSIS_TYPES:
             raise VideoAnalysisError(f"analysis_type must be one of: {', '.join(sorted(ANALYSIS_TYPES))}")
         source_info = self._validate_source(source)
@@ -273,36 +372,66 @@ class VideoAnalysisService:
                 )
                 self._persist(job)
 
-            key_info = self.key_pool.acquire_key()
-            if not key_info:
-                raise VideoAnalysisError("No healthy API key is available")
-            api_key = key_info["key"]
-            job.key_name = key_info["name"]
-
             if source_path is not None:
                 self._validate_downloaded_file(source_path)
                 mime_type = mimetypes.guess_type(source_path.name)[0] or mime_type
-                self._update(job, "uploading", 0.15)
-                file_info = await self._upload(source_path, mime_type, api_key)
-                job.file_uri = file_info.get("uri")
-                file_name = file_info.get("name")
-                if not job.file_uri or not file_name:
-                    raise VideoAnalysisError("Files API returned no file URI")
-                self._update(job, "processing", 0.35)
-                file_info = await self._wait_until_active(file_name, api_key, job)
-                job.file_uri = file_info.get("uri", job.file_uri)
-                mime_type = file_info.get("mimeType", mime_type)
+
+            max_key_attempts = max(1, len(self.key_pool.keys))
+            last_key_error: Exception | None = None
+
+            for attempt in range(max_key_attempts):
+                key_info = self.key_pool.acquire_key()
+                if not key_info:
+                    raise VideoAnalysisError("No healthy API key is available")
+                api_key = key_info["key"]
+                job.key_name = key_info["name"]
+                key_finalized = False
+
+                try:
+                    if source_path is not None:
+                        self._update(job, "uploading", 0.15)
+                        file_info = await self._upload(source_path, mime_type, api_key)
+                        job.file_uri = file_info.get("uri")
+                        file_name = file_info.get("name")
+                        if not job.file_uri or not file_name:
+                            raise VideoAnalysisError("Files API returned no file URI")
+                        self._update(job, "processing", 0.35)
+                        file_info = await self._wait_until_active(file_name, api_key, job)
+                        job.file_uri = file_info.get("uri", job.file_uri)
+                        mime_type = file_info.get("mimeType", mime_type)
+                    else:
+                        job.file_uri = job.source
+                    self._update(job, "analyzing", 0.55)
+                    job.result = await self._analyze(job, mime_type, api_key)
+                    job.status = "completed"
+                    self._update(job, "completed", 1.0)
+                    usage = (
+                        (job.result or {}).get("gateway_metadata", {}).get("usage", {})
+                    )
+                    self.key_pool.mark_success(api_key, usage)
+                    key_finalized = True
+                    break
+                except VideoAnalysisError as exc:
+                    self._mark_failure(api_key, exc)
+                    key_finalized = True
+                    last_key_error = exc
+                    if exc.status_code in {401, 403, 429} and attempt < max_key_attempts - 1:
+                        logger.warning(
+                            "Key %s failed with %s, failing over to next key (attempt %d/%d)",
+                            job.key_name,
+                            exc,
+                            attempt + 1,
+                            max_key_attempts,
+                        )
+                        continue
+                    raise
+                except Exception:
+                    self.key_pool.release(api_key)
+                    key_finalized = True
+                    raise
             else:
-                job.file_uri = job.source
-            self._update(job, "analyzing", 0.55)
-            job.result = await self._analyze(job, mime_type, api_key)
-            job.status = "completed"
-            self._update(job, "completed", 1.0)
-            usage = (
-                (job.result or {}).get("gateway_metadata", {}).get("usage", {})
-            )
-            self.key_pool.mark_success(api_key, usage)
-            key_finalized = True
+                if last_key_error:
+                    raise last_key_error
         except asyncio.CancelledError:
             job.status = "cancelled"
             self._update(job, "cancelled", job.progress)
@@ -412,19 +541,32 @@ class VideoAnalysisService:
         if self.cookies_from_browser:
             options["cookiesfrombrowser"] = (self.cookies_from_browser,)
 
+        info = None
+        prepared_path = None
         try:
             with YoutubeDL(options) as downloader:
                 info = downloader.extract_info(url, download=True)
                 prepared_path = Path(downloader.prepare_filename(info))
-        except DownloadError as exc:
-            if source_type in {"douyin", "web"}:
-                return self._download_page_with_browser(
-                    url, source_type, workspace, exc
-                )
-            raise VideoAnalysisError(
-                "Bilibili returned no downloadable public stream. "
-                "The video may require login cookies, region access, or ffmpeg."
-            ) from exc
+        except Exception as exc:
+            if self.cookies_from_browser:
+                try:
+                    options_no_cookies = dict(options)
+                    options_no_cookies.pop("cookiesfrombrowser", None)
+                    with YoutubeDL(options_no_cookies) as downloader:
+                        info = downloader.extract_info(url, download=True)
+                        prepared_path = Path(downloader.prepare_filename(info))
+                except Exception as inner_exc:
+                    exc = inner_exc
+
+            if info is None:
+                if source_type in {"douyin", "web"}:
+                    return self._download_page_with_browser(
+                        url, source_type, workspace, exc
+                    )
+                raise VideoAnalysisError(
+                    f"{source_type} returned no downloadable public stream. "
+                    "The video may require login cookies, region access, or ffmpeg."
+                ) from exc
 
         candidates = [prepared_path] if prepared_path.is_file() else []
         candidates.extend(
@@ -677,12 +819,19 @@ class VideoAnalysisService:
         raise VideoAnalysisError("Timed out waiting for Gemini video processing")
 
     async def _analyze(self, job: VideoJob, mime_type: str, api_key: str) -> dict:
+        if job.analysis_type == "remotion":
+            schema = REMOTION_ANALYSIS_SCHEMA
+        elif job.analysis_type == "curation":
+            schema = CURATION_ANALYSIS_SCHEMA
+        else:
+            schema = GENERAL_ANALYSIS_SCHEMA
+
         payload = {
             "contents": [{"role": "user", "parts": [
                 {"fileData": {"fileUri": job.file_uri, "mimeType": mime_type}},
                 {"text": self._prompt(job.analysis_type, job.prompt)},
             ]}],
-            "generationConfig": {"responseMimeType": "application/json", "responseSchema": ANALYSIS_SCHEMA, "temperature": 0.2},
+            "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema, "temperature": 0.2},
         }
         response = await self.client.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{job.model}:generateContent",
