@@ -1,7 +1,9 @@
 import asyncio
+import io
 import json
 import mimetypes
 import os
+import re
 import shutil
 import time
 import uuid
@@ -217,6 +219,9 @@ class VideoJob:
     file_uri: str | None = None
     result: dict | None = None
     error: str | None = None
+    archive_dir: str | None = None
+    save_threshold: float = 7.0
+    saved_path: str | None = None
 
     def public_dict(self) -> dict:
         payload = asdict(self)
@@ -266,7 +271,15 @@ class VideoAnalysisService:
         ).strip()
         self._load_jobs()
 
-    async def submit(self, source: str, analysis_type: str = "general", prompt: str | None = None, model: str = "gemini-3.5-flash-lite") -> dict:
+    async def submit(
+        self,
+        source: str,
+        analysis_type: str = "general",
+        prompt: str | None = None,
+        model: str = "gemini-3.5-flash-lite",
+        archive_dir: str | None = None,
+        save_threshold: float = 7.0,
+    ) -> dict:
         if analysis_type not in ANALYSIS_TYPES:
             raise VideoAnalysisError(f"analysis_type must be one of: {', '.join(sorted(ANALYSIS_TYPES))}")
         source_info = self._validate_source(source)
@@ -279,6 +292,8 @@ class VideoAnalysisService:
             source_type=source_info.kind,
             original_source=source_info.original,
             resolved_source=source_info.value,
+            archive_dir=archive_dir,
+            save_threshold=save_threshold,
         )
         self.jobs[job.id] = job
         self._persist(job)
@@ -357,16 +372,22 @@ class VideoAnalysisService:
         api_key: str | None = None
         key_finalized = False
         temporary_directory: Path | None = None
+        file_name: str | None = None
         try:
             mime_type = "video/mp4"
             source_path: Path | None = None
+            video_bytes: bytes | None = None
             if job.source_type == "local":
                 source_path = Path(job.source)
             elif job.source_type in {"douyin", "bilibili", "web"}:
                 self._update(job, "downloading", 0.05)
-                source_path, job.source_metadata, temporary_directory = (
+                media_data, job.source_metadata, temporary_directory = (
                     await self._download_remote(job)
                 )
+                if isinstance(media_data, bytes):
+                    video_bytes = media_data
+                else:
+                    source_path = media_data
                 job.resolved_source = (
                     job.source_metadata.get("webpage_url") or job.source
                 )
@@ -375,6 +396,9 @@ class VideoAnalysisService:
             if source_path is not None:
                 self._validate_downloaded_file(source_path)
                 mime_type = mimetypes.guess_type(source_path.name)[0] or mime_type
+            elif video_bytes is not None:
+                self._validate_video_bytes(video_bytes)
+                mime_type = "video/mp4"
 
             max_key_attempts = max(1, len(self.key_pool.keys))
             last_key_error: Exception | None = None
@@ -388,9 +412,12 @@ class VideoAnalysisService:
                 key_finalized = False
 
                 try:
-                    if source_path is not None:
+                    file_to_upload = source_path if source_path is not None else video_bytes
+                    if file_to_upload is not None:
                         self._update(job, "uploading", 0.15)
-                        file_info = await self._upload(source_path, mime_type, api_key)
+                        file_info = await self._upload(
+                            file_to_upload, mime_type, api_key, display_name=f"{job.id}.mp4"
+                        )
                         job.file_uri = file_info.get("uri")
                         file_name = file_info.get("name")
                         if not job.file_uri or not file_name:
@@ -403,6 +430,40 @@ class VideoAnalysisService:
                         job.file_uri = job.source
                     self._update(job, "analyzing", 0.55)
                     job.result = await self._analyze(job, mime_type, api_key)
+
+                    # Auto-archive funnel for curation or explicit archive_dir
+                    if job.archive_dir:
+                        try:
+                            should_save = True
+                            score = 0.0
+                            if job.analysis_type == "curation" and job.result:
+                                score = float(
+                                    job.result.get("curation_score")
+                                    or job.result.get("score")
+                                    or 0.0
+                                )
+                                should_save = score >= job.save_threshold
+                            if should_save:
+                                target_dir = Path(job.archive_dir)
+                                target_dir.mkdir(parents=True, exist_ok=True)
+                                title = (job.source_metadata or {}).get("title") or job.id
+                                clean_title = re.sub(r'[\\/*?:"<>|]', "", title)[:40]
+                                prefix = f"[Score-{score:.1f}]" if job.analysis_type == "curation" else ""
+                                dest_file = target_dir / f"{prefix}[{job.source_type}]_{clean_title}.mp4"
+                                if video_bytes:
+                                    dest_file.write_bytes(video_bytes)
+                                elif source_path and source_path.is_file():
+                                    shutil.copy2(source_path, dest_file)
+                                report_file = dest_file.with_suffix(".json")
+                                report_file.write_text(
+                                    json.dumps(job.result, ensure_ascii=False, indent=2),
+                                    encoding="utf-8",
+                                )
+                                job.saved_path = str(dest_file)
+                                logger.info("Video successfully archived to %s", dest_file)
+                        except Exception as archive_exc:
+                            logger.warning("Failed to auto-archive video: %s", archive_exc)
+
                     job.status = "completed"
                     self._update(job, "completed", 1.0)
                     usage = (
@@ -458,6 +519,14 @@ class VideoAnalysisService:
                 await asyncio.to_thread(
                     shutil.rmtree, temporary_directory, ignore_errors=True
                 )
+            if file_name and api_key:
+                try:
+                    await self.client.delete(
+                        f"https://generativelanguage.googleapis.com/v1beta/{file_name.removeprefix('/')}",
+                        headers={"x-goog-api-key": api_key},
+                    )
+                except Exception:
+                    pass
 
     def _validate_downloaded_file(self, path: Path):
         if not path.is_file():
@@ -483,11 +552,33 @@ class VideoAnalysisService:
                 "The source is not a real video file; it may be an HTML verification page"
             )
 
-    async def _download_remote(self, job: VideoJob) -> tuple[Path, dict, Path]:
+    def _validate_video_bytes(self, data: bytes):
+        if not data:
+            raise VideoAnalysisError("Video downloader returned empty media data")
+        if len(data) > self.max_upload_bytes:
+            raise VideoAnalysisError("Video exceeds the configured upload limit")
+        header = data[:32]
+        signatures = (
+            len(header) >= 12 and header[4:8] == b"ftyp",
+            header.startswith(b"\x1a\x45\xdf\xa3"),
+            header.startswith(b"FLV"),
+            header.startswith(b"\x00\x00\x01\xba"),
+            header.startswith(b"\x00\x00\x01\xb3"),
+            header.startswith(b"0&\xb2u\x8ef\xcf\x11\xa6\xd9\x00\xaa\x00b\xcel"),
+            header.startswith(b"RIFF") and header[8:12] == b"AVI ",
+        )
+        if not any(signatures):
+            raise VideoAnalysisError(
+                "The stream is not a real video file; it may be an HTML verification page"
+            )
+
+    async def _download_remote(
+        self, job: VideoJob
+    ) -> tuple[Path | bytes, dict, Path | None]:
         workspace = self.download_dir / job.id
         workspace.mkdir(parents=True, exist_ok=False)
         try:
-            path, metadata = await asyncio.wait_for(
+            media_data, metadata = await asyncio.wait_for(
                 asyncio.to_thread(
                     self._download_remote_sync,
                     job.source,
@@ -496,7 +587,7 @@ class VideoAnalysisService:
                 ),
                 timeout=self.download_timeout,
             )
-            return path, metadata, workspace
+            return media_data, metadata, workspace
         except TimeoutError as exc:
             shutil.rmtree(workspace, ignore_errors=True)
             raise VideoAnalysisError(
@@ -512,7 +603,7 @@ class VideoAnalysisService:
 
     def _download_remote_sync(
         self, url: str, source_type: str, workspace: Path
-    ) -> tuple[Path, dict]:
+    ) -> tuple[Path | bytes, dict]:
         try:
             validate_public_url(url)
         except ValueError as exc:
@@ -595,6 +686,15 @@ class VideoAnalysisService:
             if info.get(key) is not None
         }
         metadata["source_type"] = source_type
+
+        # RAM vs ROM Dual-track check: if <= 50MB, read into RAM buffer and unlink file
+        if path.stat().st_size <= 50 * 1024 * 1024:
+            media_bytes = path.read_bytes()
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return media_bytes, metadata
         return path, metadata
 
     def _download_page_with_browser(
@@ -603,7 +703,7 @@ class VideoAnalysisService:
         source_type: str,
         workspace: Path,
         yt_dlp_error: Exception,
-    ) -> tuple[Path, dict]:
+    ) -> tuple[Path | bytes, dict]:
         try:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
             from playwright.sync_api import sync_playwright
@@ -623,6 +723,12 @@ class VideoAnalysisService:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/150.0.0.0 Safari/537.36"
         )
+        captured_media: list[tuple[str, str, int]] = []
+        best_dom: dict | None = None
+        title = ""
+        final_url = url
+        cookies: dict[str, str] = {}
+
         try:
             with sync_playwright() as playwright:
                 browser = playwright.chromium.launch(
@@ -637,62 +743,113 @@ class VideoAnalysisService:
                         user_agent=user_agent,
                     )
                     page = context.new_page()
+
+                    def on_response(res):
+                        try:
+                            res_url = res.url
+                            ct = (res.headers.get("content-type") or "").lower()
+                            if "uuu_265.mp4" in res_url or res_url.endswith(".js") or res_url.endswith(".css"):
+                                return
+                            if "media-video" in res_url:
+                                captured_media.append((res_url, ct, 10))
+                            elif "douyinvod.com" in res_url:
+                                captured_media.append((res_url, ct, 8))
+                            elif ct.startswith("video/"):
+                                captured_media.append((res_url, ct, 5))
+                        except Exception:
+                            pass
+
+                    page.on("response", on_response)
                     page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                    page.wait_for_function(
-                        """
-                        () => [...document.querySelectorAll('video')].some(
-                          (video) => video.currentSrc &&
-                            Number.isFinite(video.duration) && video.duration > 5
+
+                    try:
+                        page.wait_for_function(
+                            """
+                            () => [...document.querySelectorAll('video')].some(
+                              (v) => (v.currentSrc || v.src) && Number.isFinite(v.duration) && v.duration > 3
+                            )
+                            """,
+                            timeout=30_000,
                         )
-                        """,
-                        timeout=30_000,
-                    )
-                    video = page.locator("video").evaluate_all(
+                    except PlaywrightTimeoutError:
+                        time.sleep(2)
+
+                    # Performance API sniffing
+                    perf_urls = page.evaluate(
                         """
-                        (videos) => videos
-                          .map((video) => ({
-                            src: video.currentSrc || video.src,
-                            duration: video.duration,
-                            width: video.videoWidth,
-                            height: video.videoHeight,
-                          }))
-                          .filter((video) => video.src && video.duration > 5)
-                          .sort((left, right) => right.duration - left.duration)[0]
+                        () => performance.getEntriesByType('resource')
+                            .map(e => e.name)
+                            .filter(u => (u.includes('douyinvod.com') || u.includes('media-video') || u.includes('.mp4')) && !u.includes('douyinstatic.com'))
                         """
                     )
+                    for pu in perf_urls:
+                        prio = 9 if "media-video" in pu else 7
+                        captured_media.append((pu, "video/mp4", prio))
+
+                    # Inspect DOM video tags
+                    dom_videos = page.evaluate(
+                        """
+                        () => [...document.querySelectorAll('video')].map(v => ({
+                            src: v.currentSrc || v.src || '',
+                            duration: v.duration || 0,
+                            width: v.videoWidth || 0,
+                            height: v.videoHeight || 0
+                        }))
+                        """
+                    )
+                    for dv in dom_videos:
+                        s = dv.get("src", "")
+                        if s and not s.startswith("blob:") and (s.startswith("http://") or s.startswith("https://")):
+                            if not best_dom or dv.get("duration", 0) > best_dom.get("duration", 0):
+                                best_dom = dv
+
+                    title = page.title()
+                    final_url = page.url
                     cookies = {
                         cookie["name"]: cookie["value"]
                         for cookie in context.cookies()
                     }
-                    metadata = {
-                        "title": page.title(),
-                        "duration": video["duration"],
-                        "width": video["width"],
-                        "height": video["height"],
-                        "webpage_url": page.url,
-                        "extractor": f"{source_type}-browser",
-                        "source_type": source_type,
-                    }
-                    media_url = video["src"]
-                    referer = page.url
                 finally:
                     browser.close()
         except PlaywrightTimeoutError as exc:
             raise VideoAnalysisError(
-                "The page loaded but no playable public video stream was found"
+                "The page loaded but timed out waiting for playable video stream"
             ) from exc
 
+        target_media_url = None
+        if captured_media:
+            captured_media.sort(key=lambda item: item[2], reverse=True)
+            target_media_url = captured_media[0][0]
+        elif best_dom and best_dom.get("src"):
+            target_media_url = best_dom["src"]
+
+        if not target_media_url:
+            raise VideoAnalysisError(
+                "The page loaded but no playable public or sniffed video stream was found"
+            )
+
+        metadata = {
+            "title": title,
+            "duration": (best_dom or {}).get("duration"),
+            "width": (best_dom or {}).get("width"),
+            "height": (best_dom or {}).get("height"),
+            "webpage_url": final_url,
+            "extractor": f"{source_type}-browser-sniff",
+            "source_type": source_type,
+            "sniffed_media_url": target_media_url[:120],
+        }
+
         destination = workspace / f"{source_type}.mp4"
-        self._download_browser_media(
-            media_url,
+        media_result = self._fetch_browser_media(
+            target_media_url,
             destination,
             cookies=cookies,
-            referer=referer,
+            referer=final_url,
             user_agent=user_agent,
         )
-        return destination, metadata
+        return media_result, metadata
 
-    def _download_browser_media(
+    def _fetch_browser_media(
         self,
         media_url: str,
         destination: Path,
@@ -700,13 +857,19 @@ class VideoAnalysisService:
         cookies: dict[str, str],
         referer: str,
         user_agent: str,
-    ) -> None:
+    ) -> Path | bytes:
         current_url = media_url
         timeout = httpx.Timeout(60, read=self.download_timeout)
+        headers = {"User-Agent": user_agent}
+        if "douyin" in referer or "douyinvod" in media_url:
+            headers["Referer"] = "https://www.douyin.com/"
+        else:
+            headers["Referer"] = referer
+
         with httpx.Client(
             follow_redirects=False,
             timeout=timeout,
-            headers={"User-Agent": user_agent, "Referer": referer},
+            headers=headers,
         ) as client:
             for _ in range(6):
                 try:
@@ -727,26 +890,58 @@ class VideoAnalysisService:
                             f"Video media stream returned HTTP {response.status_code}"
                         )
                     content_type = response.headers.get("content-type", "").lower()
-                    if not content_type.startswith("video/"):
+                    if content_type and not (
+                        content_type.startswith("video/")
+                        or "octet-stream" in content_type
+                        or "application/mp4" in content_type
+                    ):
                         raise VideoAnalysisError(
-                            "Video media stream returned "
-                            f"{content_type or 'unknown content'}"
+                            f"Video media stream returned unexpected content type: {content_type}"
                         )
+
                     declared_size = int(response.headers.get("content-length") or 0)
                     if declared_size > self.max_upload_bytes:
                         raise VideoAnalysisError(
                             "Video exceeds the configured upload limit"
                         )
+
+                    # RAM vs ROM Dual-track streaming
+                    # Threshold: 50MB (50 * 1024 * 1024 bytes)
+                    ram_threshold = 50 * 1024 * 1024
                     downloaded = 0
-                    with destination.open("wb") as handle:
+                    buffer = io.BytesIO()
+                    file_handle = None
+
+                    try:
                         for chunk in response.iter_bytes(1024 * 1024):
                             downloaded += len(chunk)
                             if downloaded > self.max_upload_bytes:
                                 raise VideoAnalysisError(
                                     "Video exceeds the configured upload limit"
                                 )
-                            handle.write(chunk)
-                    return
+                            if file_handle is not None:
+                                file_handle.write(chunk)
+                            else:
+                                buffer.write(chunk)
+                                if downloaded > ram_threshold:
+                                    # Spill over to disk (ROM)
+                                    file_handle = destination.open("wb")
+                                    file_handle.write(buffer.getvalue())
+                                    buffer = None  # Free RAM
+                    finally:
+                        if file_handle is not None:
+                            file_handle.close()
+
+                    if file_handle is not None:
+                        # Video was spilled to disk
+                        self._validate_downloaded_file(destination)
+                        return destination
+                    else:
+                        # Video remains purely in RAM!
+                        data = buffer.getvalue()
+                        self._validate_video_bytes(data)
+                        return data
+
         raise VideoAnalysisError("Video media stream exceeded the redirect limit")
 
     @staticmethod
@@ -773,8 +968,22 @@ class VideoAnalysisService:
         else:
             self.key_pool.release(api_key)
 
-    async def _upload(self, path: Path, mime_type: str, api_key: str) -> dict:
-        size = path.stat().st_size
+    async def _upload(
+        self,
+        media: Path | bytes,
+        mime_type: str,
+        api_key: str,
+        display_name: str | None = None,
+    ) -> dict:
+        if isinstance(media, bytes):
+            size = len(media)
+            file_name = display_name or "video.mp4"
+            content = media
+        else:
+            size = media.stat().st_size
+            file_name = display_name or media.name
+            content = _file_chunks(media)
+
         start = await self.client.post(
             "https://generativelanguage.googleapis.com/upload/v1beta/files",
             headers={
@@ -785,7 +994,7 @@ class VideoAnalysisService:
                 "X-Goog-Upload-Header-Content-Type": mime_type,
                 "Content-Type": "application/json",
             },
-            json={"file": {"display_name": path.name}},
+            json={"file": {"display_name": file_name}},
         )
         self._raise_for_google(start, "start video upload")
         upload_url = start.headers.get("x-goog-upload-url")
@@ -793,8 +1002,12 @@ class VideoAnalysisService:
             raise VideoAnalysisError("Files API returned no upload URL")
         uploaded = await self.client.post(
             upload_url,
-            headers={"Content-Length": str(size), "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"},
-            content=_file_chunks(path),
+            headers={
+                "Content-Length": str(size),
+                "X-Goog-Upload-Offset": "0",
+                "X-Goog-Upload-Command": "upload, finalize",
+            },
+            content=content,
         )
         self._raise_for_google(uploaded, "upload video")
         data = uploaded.json()

@@ -38,10 +38,28 @@ async def submit_video_analysis(
     analysis_type: str = "general",
     prompt: str | None = None,
     model: str = "gemini-3.5-flash-lite",
+    archive_dir: str | None = None,
+    save_threshold: float = 7.0,
 ) -> dict:
-    """Submit YouTube/Douyin/Bilibili share text, a URL, or a local file for analysis."""
+    """Submit YouTube/Douyin/Bilibili share text, a URL, or a local file for analysis.
+    
+    Args:
+        source: Video URL, share text, or local file path.
+        analysis_type: Analysis mode ('general', 'curation', 'remotion', 'vox', 'vlog', 'technical', 'transcript').
+        prompt: Optional custom instructions or focus points.
+        model: Gemini model to use for multimodal processing.
+        archive_dir: Optional directory to archive high-quality video & report (zero disk usage if omitted).
+        save_threshold: Minimum curation_score (default 7.0) to trigger auto-archiving.
+    """
     try:
-        return await get_video_service().submit(source, analysis_type, prompt, model)
+        return await get_video_service().submit(
+            source=source,
+            analysis_type=analysis_type,
+            prompt=prompt,
+            model=model,
+            archive_dir=archive_dir,
+            save_threshold=save_threshold,
+        )
     except VideoAnalysisError as exc:
         return {"status": "rejected", "error": str(exc)}
 
@@ -70,11 +88,30 @@ async def analyze_video(
     analysis_type: str = "general",
     prompt: str | None = None,
     model: str = "gemini-3.5-flash-lite",
+    archive_dir: str | None = None,
+    save_threshold: float = 7.0,
     timeout_seconds: float = 900,
     ctx: Context | None = None,
 ) -> dict:
-    """Analyze a video synchronously while reporting stage progress."""
-    submitted = await submit_video_analysis(source, analysis_type, prompt, model)
+    """Analyze a video synchronously while reporting stage progress.
+    
+    Args:
+        source: Video URL, share text, or local file path.
+        analysis_type: Analysis mode ('general', 'curation', 'remotion', 'vox', 'vlog', 'technical', 'transcript').
+        prompt: Optional custom instructions or focus points.
+        model: Gemini model to use.
+        archive_dir: Optional directory to archive high-quality video & report.
+        save_threshold: Minimum curation score (default 7.0) to auto-archive.
+        timeout_seconds: Max seconds to wait for completion.
+    """
+    submitted = await submit_video_analysis(
+        source=source,
+        analysis_type=analysis_type,
+        prompt=prompt,
+        model=model,
+        archive_dir=archive_dir,
+        save_threshold=save_threshold,
+    )
     if submitted.get("status") == "rejected":
         return submitted
     job_id = submitted["id"]

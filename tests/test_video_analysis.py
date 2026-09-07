@@ -157,7 +157,9 @@ class VideoAnalysisTests(unittest.IsolatedAsyncioTestCase):
                 completed = service.get(submitted["id"])
                 self.assertEqual(completed["status"], "completed")
                 self.assertEqual(completed["file_uri"], "https://files.test/video")
-                self.assertEqual(len(calls), 4)
+                self.assertEqual(len(calls), 5)
+                self.assertEqual(calls[-1][0], "DELETE")
+                self.assertTrue(calls[-1][1].endswith("/files/test"))
 
     async def test_arbitrary_http_url_is_queued_for_web_resolution(self):
         with tempfile.TemporaryDirectory() as job_dir:
@@ -181,6 +183,111 @@ class VideoAnalysisTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with self.assertRaisesRegex(VideoAnalysisError, "not a real video"):
                     await service.submit(str(video))
+
+    async def test_ram_streaming_bytes_upload_and_zero_disk(self):
+        calls = []
+
+        async def handler(request: httpx.Request):
+            calls.append((request.method, str(request.url)))
+            if request.url.host == "upload.test":
+                return httpx.Response(
+                    200,
+                    json={
+                        "file": {
+                            "name": "files/ram_test",
+                            "uri": "https://files.test/ram_video",
+                            "mimeType": "video/mp4",
+                        }
+                    },
+                )
+            if request.url.path == "/upload/v1beta/files":
+                return httpx.Response(
+                    200, headers={"x-goog-upload-url": "https://upload.test/final"}
+                )
+            if request.method == "GET" and request.url.path.endswith("/files/ram_test"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "name": "files/ram_test",
+                        "uri": "https://files.test/ram_video",
+                        "mimeType": "video/mp4",
+                        "state": "ACTIVE",
+                    },
+                )
+            return _analysis_response()
+
+        with tempfile.TemporaryDirectory() as job_dir:
+            downloads = Path(job_dir) / "downloads"
+            downloads.mkdir()
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                service = VideoAnalysisService(
+                    KeyManager("test|fake-key"), client, job_dir=job_dir,
+                    download_dir=downloads
+                )
+                # Mock _download_remote_sync to return bytes (in-RAM stream)
+                with mock.patch.object(
+                    service,
+                    "_download_remote_sync",
+                    return_value=(VALID_MP4_HEADER, {"title": "RAM Video", "webpage_url": "https://example.com/v"}),
+                ):
+                    submitted = await service.submit("https://example.com/video.mp4")
+                    await service.tasks[submitted["id"]]
+                    completed = service.get(submitted["id"])
+                    self.assertEqual(completed["status"], "completed")
+                    self.assertEqual(completed["file_uri"], "https://files.test/ram_video")
+                    # Assert no stray video files left in downloads
+                    job_workspace = downloads / submitted["id"]
+                    self.assertFalse(job_workspace.exists())
+
+    async def test_auto_archive_curation_threshold(self):
+        high_score_result = {
+            "summary": "Epic Drama",
+            "curation_score": 8.5,
+            "plot_and_characters": {"main_plot": "A", "conflict_and_twists": "B"},
+            "watermark_and_quality": {"has_platform_watermark": False, "has_author_watermark": False, "visual_clarity": "1080p"},
+            "tiktok_potential": {"opening_hook_score": 9, "curation_score": 8.5},
+        }
+
+        async def handler(request: httpx.Request):
+            if request.url.host == "upload.test":
+                return httpx.Response(
+                    200,
+                    json={"file": {"name": "files/test", "uri": "https://files.test/v", "mimeType": "video/mp4"}},
+                )
+            if request.url.path == "/upload/v1beta/files":
+                return httpx.Response(200, headers={"x-goog-upload-url": "https://upload.test/final"})
+            if request.method == "GET" and request.url.path.endswith("/files/test"):
+                return httpx.Response(200, json={"name": "files/test", "uri": "https://files.test/v", "state": "ACTIVE"})
+            return httpx.Response(
+                200,
+                json={"candidates": [{"content": {"parts": [{"text": json.dumps(high_score_result)}]}}]},
+            )
+
+        with tempfile.TemporaryDirectory() as archive_dir, tempfile.TemporaryDirectory() as job_dir:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                service = VideoAnalysisService(
+                    KeyManager("test|fake-key"), client, job_dir=job_dir,
+                    download_dir=Path(job_dir) / "downloads"
+                )
+                with mock.patch.object(
+                    service,
+                    "_download_remote_sync",
+                    return_value=(VALID_MP4_HEADER, {"title": "Test Drama", "webpage_url": "https://example.com/drama"}),
+                ):
+                    submitted = await service.submit(
+                        "https://example.com/drama",
+                        analysis_type="curation",
+                        archive_dir=archive_dir,
+                        save_threshold=7.0,
+                    )
+                    await service.tasks[submitted["id"]]
+                    completed = service.get(submitted["id"])
+                    self.assertEqual(completed["status"], "completed")
+                    self.assertIsNotNone(completed.get("saved_path"))
+                    saved_video = Path(completed["saved_path"])
+                    self.assertTrue(saved_video.is_file())
+                    self.assertTrue(saved_video.name.startswith("[Score-8.5]"))
+                    self.assertTrue(saved_video.with_suffix(".json").is_file())
 
 
 if __name__ == "__main__":
