@@ -39,7 +39,9 @@ data/video_downloads/
 data/key_pool_state.json
 data/backlog/
 data/*.mp4
-data/test_workspace/
+data/test_workspace*/
+data/browser_profile/
+data/*
 
 # Root temporary debug & scratch scripts
 debug_*.py
