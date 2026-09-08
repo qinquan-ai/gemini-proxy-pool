@@ -979,6 +979,10 @@ class VideoAnalysisService:
             size = len(media)
             file_name = display_name or "video.mp4"
             content = media
+        elif media.stat().st_size <= 60 * 1024 * 1024:
+            size = media.stat().st_size
+            file_name = display_name or media.name
+            content = media.read_bytes()
         else:
             size = media.stat().st_size
             file_name = display_name or media.name

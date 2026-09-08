@@ -216,7 +216,10 @@ def openai_error(message: str, status_code: int, error_type: str):
 
 
 def finalize_failed_response(
-    api_key: str, response: httpx.Response, message: str
+    api_key: str,
+    response: httpx.Response,
+    message: str,
+    model: str | None = None,
 ) -> str:
     status = response.status_code
     if status == 429:
@@ -226,16 +229,18 @@ def finalize_failed_response(
             reason=message,
             cooldown_seconds=cooldown,
             rate_limited=True,
+            model=model,
         )
         return "retry"
     if status == 401:
-        key_pool.mark_failure(api_key, reason=message, disable=True)
+        key_pool.mark_failure(api_key, reason=message, disable=True, model=model)
         return "retry"
     if status == 403:
         key_pool.mark_failure(
             api_key,
             reason=message,
             cooldown_seconds=PERMISSION_COOLDOWN_SECONDS,
+            model=model,
         )
         return "retry"
     if status in (408, 409, 425, 500, 502, 503, 504):
@@ -243,6 +248,7 @@ def finalize_failed_response(
             api_key,
             reason=message,
             cooldown_seconds=key_pool.transient_cooldown,
+            model=model,
         )
         return "retry"
 
@@ -349,8 +355,13 @@ async def native_gemini_gateway(google_path: str, request: Request):
     target = f"https://generativelanguage.googleapis.com/v1beta/{google_path}"
     is_stream = "streamGenerateContent" in google_path
 
+    extracted_model = None
+    if "models/" in google_path:
+        m_part = google_path.split("models/", 1)[1]
+        extracted_model = m_part.split(":", 1)[0].split("/", 1)[0]
+
     for attempt in range(max(1, len(key_pool.keys))):
-        key_info = key_pool.acquire_key()
+        key_info = key_pool.acquire_key(model=extracted_model)
         if not key_info:
             break
         api_key = key_info["key"]
@@ -370,7 +381,7 @@ async def native_gemini_gateway(google_path: str, request: Request):
                 if upstream.status_code >= 400:
                     error_body = await upstream.aread()
                     message = google_error_message(upstream, error_body)
-                    action = finalize_failed_response(api_key, upstream, message)
+                    action = finalize_failed_response(api_key, upstream, message, model=extracted_model)
                     finalized = True
                     await upstream.aclose()
                     if action == "retry":
@@ -389,7 +400,7 @@ async def native_gemini_gateway(google_path: str, request: Request):
                             usage_tail = (usage_tail + chunk)[-262_144:]
                             yield chunk
                         key_pool.mark_success(
-                            api_key, usage_metadata_from_sse_tail(usage_tail)
+                            api_key, usage_metadata_from_sse_tail(usage_tail), model=extracted_model
                         )
                         stream_finalized = True
                     except (httpx.HTTPError, OSError) as exc:
@@ -397,6 +408,7 @@ async def native_gemini_gateway(google_path: str, request: Request):
                             api_key,
                             reason=f"Native stream transport error: {exc}",
                             cooldown_seconds=key_pool.transient_cooldown,
+                            model=extracted_model,
                         )
                         stream_finalized = True
                         raise
@@ -415,7 +427,7 @@ async def native_gemini_gateway(google_path: str, request: Request):
             upstream = await request.app.state.http_client.send(upstream_request)
             if upstream.status_code >= 400:
                 message = google_error_message(upstream)
-                action = finalize_failed_response(api_key, upstream, message)
+                action = finalize_failed_response(api_key, upstream, message, model=extracted_model)
                 finalized = True
                 if action == "retry":
                     continue
@@ -428,7 +440,7 @@ async def native_gemini_gateway(google_path: str, request: Request):
                 usage = usage_metadata_from_payload(upstream.json())
             except ValueError:
                 usage = {}
-            key_pool.mark_success(api_key, usage)
+            key_pool.mark_success(api_key, usage, model=extracted_model)
             finalized = True
             return Response(
                 content=upstream.content,
@@ -441,6 +453,7 @@ async def native_gemini_gateway(google_path: str, request: Request):
                     api_key,
                     reason=f"Native gateway transport error: {exc}",
                     cooldown_seconds=key_pool.transient_cooldown,
+                    model=extracted_model,
                 )
                 finalized = True
             logger.warning(
@@ -491,9 +504,12 @@ async def list_models(request: Request):
 @app.get("/v1/status")
 async def get_status():
     status = key_pool.get_status()
+    quota_status = key_pool.get_quota_status()
     status["default_model"] = DEFAULT_MODEL
     status["models"] = AVAILABLE_MODELS
     status["auth_enabled"] = bool(PROXY_API_TOKEN)
+    status["quota_summary"] = quota_status.get("summary_by_model", {})
+    status["quota_reset_in_hours"] = quota_status.get("next_reset_in_hours")
     video_service = getattr(app.state, "video_service", None)
     jobs = list(video_service.jobs.values()) if video_service else []
     status["mcp_endpoint"] = "/mcp/"
@@ -529,6 +545,12 @@ async def get_status():
         for job in sorted(jobs, key=lambda item: item.updated_at, reverse=True)[:8]
     ]
     return JSONResponse(content=status)
+
+
+@app.get("/v1/quota")
+@app.get("/stats/quota")
+async def get_quota_details():
+    return JSONResponse(content=key_pool.get_quota_status())
 
 
 @app.post("/v1/chat/completions")
@@ -652,7 +674,7 @@ async def stream_with_retry(
     created_at: int,
 ):
     for attempt in range(max(1, len(key_pool.keys))):
-        key_info = key_pool.acquire_key()
+        key_info = key_pool.acquire_key(model=model)
         if not key_info:
             break
 
@@ -667,7 +689,7 @@ async def stream_with_retry(
                 if response.status_code != 200:
                     body = await response.aread()
                     message = google_error_message(response, body)
-                    action = finalize_failed_response(api_key, response, message)
+                    action = finalize_failed_response(api_key, response, message, model=model)
                     finalized = True
                     if action == "retry":
                         logger.warning(
@@ -708,7 +730,7 @@ async def stream_with_retry(
                             "tool_calls",
                         )
 
-                key_pool.mark_success(api_key, usage)
+                key_pool.mark_success(api_key, usage, model=model)
                 finalized = True
                 yield _sse_chunk(chat_id, created_at, model, {}, "stop")
                 yield "data: [DONE]\n\n"
@@ -719,6 +741,7 @@ async def stream_with_retry(
                     api_key,
                     reason=f"Transport error: {exc}",
                     cooldown_seconds=key_pool.transient_cooldown,
+                    model=model,
                 )
                 finalized = True
             logger.warning("Streaming transport error for %s: %s", key_info["name"], exc)
@@ -934,7 +957,7 @@ async def complete_with_retry(
     created_at: int,
 ):
     for attempt in range(max(1, len(key_pool.keys))):
-        key_info = key_pool.acquire_key()
+        key_info = key_pool.acquire_key(model=model)
         if not key_info:
             break
 
@@ -948,7 +971,7 @@ async def complete_with_retry(
             )
             if response.status_code != 200:
                 message = google_error_message(response)
-                action = finalize_failed_response(api_key, response, message)
+                action = finalize_failed_response(api_key, response, message, model=model)
                 finalized = True
                 if action == "retry":
                     logger.warning(
@@ -963,7 +986,7 @@ async def complete_with_retry(
             data = response.json()
             text_chunks, tool_calls, finish_reason = extract_response_parts(data)
             usage = usage_metadata_from_payload(data)
-            key_pool.mark_success(api_key, usage)
+            key_pool.mark_success(api_key, usage, model=model)
             finalized = True
 
             message = {"role": "assistant", "content": "".join(text_chunks) or None}
@@ -996,6 +1019,7 @@ async def complete_with_retry(
                     api_key,
                     reason=f"Transport error: {exc}",
                     cooldown_seconds=key_pool.transient_cooldown,
+                    model=model,
                 )
                 finalized = True
             logger.warning("Transport error for %s: %s", key_info["name"], exc)
