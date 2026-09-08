@@ -162,6 +162,16 @@ def cmd_recommend(args):
     print()
 
 
+def cmd_snapshot(args):
+    from app.core.studio_inspector import StudioInspector, DEFAULT_AI_STUDIO_URL, DEFAULT_PROFILE
+    inspector = StudioInspector(
+        profile_name=args.profile or DEFAULT_PROFILE,
+        target_url=args.url or DEFAULT_AI_STUDIO_URL,
+    )
+    saved_img = inspector.capture_snapshot(output_path=args.output, wait_seconds=args.wait)
+    print(f"[*] Snapshot ready for quota calibration: {saved_img}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="StudioKey Proxy CLI Management Tool")
     subparsers = parser.add_subparsers(dest="subcommand", help="Available commands")
@@ -174,6 +184,13 @@ def main():
 
     p_recommend = subparsers.add_parser("recommend", help="Recommend optimal model based on remaining quota")
     p_recommend.set_defaults(func=cmd_recommend)
+
+    p_snap = subparsers.add_parser("snapshot", help="Launch visible Chrome (Profile 1) and capture AI Studio quota snapshot")
+    p_snap.add_argument("--profile", default="Profile 1", help="Chrome profile directory (default: Profile 1)")
+    p_snap.add_argument("--url", help="AI Studio rate limit URL")
+    p_snap.add_argument("--wait", type=int, default=8, help="Wait seconds for chart rendering")
+    p_snap.add_argument("--output", "-o", help="Custom output image file path")
+    p_snap.set_defaults(func=cmd_snapshot)
 
     args = parser.parse_args()
     if not args.subcommand:
