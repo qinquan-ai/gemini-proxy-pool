@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 
 from app.core.key_manager import KeyManager
 from app.core.video_sources import VideoSource, parse_video_source, validate_public_url
+from app.core.video_downloader import (
+    VideoDownloader,
+    VideoDownloadError,
+    validate_video_file,
+    validate_video_bytes,
+    find_browser_executable,
+)
 
 
 SUPPORTED_VIDEO_MIME_TYPES = {
@@ -269,6 +276,12 @@ class VideoAnalysisService:
         self.cookies_from_browser = os.getenv(
             "VIDEO_YTDLP_COOKIES_FROM_BROWSER", ""
         ).strip()
+        self.downloader = VideoDownloader(
+            download_dir=self.download_dir,
+            download_timeout=self.download_timeout,
+            cookies_from_browser=self.cookies_from_browser,
+            max_bytes=self.max_upload_bytes,
+        )
         self._load_jobs()
 
     async def submit(
@@ -529,48 +542,16 @@ class VideoAnalysisService:
                     pass
 
     def _validate_downloaded_file(self, path: Path):
-        if not path.is_file():
-            raise VideoAnalysisError("Video downloader returned no media file")
-        if path.stat().st_size > self.max_upload_bytes:
-            raise VideoAnalysisError("Video exceeds the configured upload limit")
-        mime_type = mimetypes.guess_type(path.name)[0]
-        if mime_type not in SUPPORTED_VIDEO_MIME_TYPES:
-            raise VideoAnalysisError(f"Unsupported video MIME type: {mime_type}")
-        with path.open("rb") as handle:
-            header = handle.read(32)
-        signatures = (
-            len(header) >= 12 and header[4:8] == b"ftyp",
-            header.startswith(b"\x1a\x45\xdf\xa3"),
-            header.startswith(b"FLV"),
-            header.startswith(b"\x00\x00\x01\xba"),
-            header.startswith(b"\x00\x00\x01\xb3"),
-            header.startswith(b"0&\xb2u\x8ef\xcf\x11\xa6\xd9\x00\xaa\x00b\xcel"),
-            header.startswith(b"RIFF") and header[8:12] == b"AVI ",
-        )
-        if not any(signatures):
-            raise VideoAnalysisError(
-                "The source is not a real video file; it may be an HTML verification page"
-            )
+        try:
+            validate_video_file(path, self.max_upload_bytes)
+        except VideoDownloadError as exc:
+            raise VideoAnalysisError(str(exc)) from exc
 
     def _validate_video_bytes(self, data: bytes):
-        if not data:
-            raise VideoAnalysisError("Video downloader returned empty media data")
-        if len(data) > self.max_upload_bytes:
-            raise VideoAnalysisError("Video exceeds the configured upload limit")
-        header = data[:32]
-        signatures = (
-            len(header) >= 12 and header[4:8] == b"ftyp",
-            header.startswith(b"\x1a\x45\xdf\xa3"),
-            header.startswith(b"FLV"),
-            header.startswith(b"\x00\x00\x01\xba"),
-            header.startswith(b"\x00\x00\x01\xb3"),
-            header.startswith(b"0&\xb2u\x8ef\xcf\x11\xa6\xd9\x00\xaa\x00b\xcel"),
-            header.startswith(b"RIFF") and header[8:12] == b"AVI ",
-        )
-        if not any(signatures):
-            raise VideoAnalysisError(
-                "The stream is not a real video file; it may be an HTML verification page"
-            )
+        try:
+            validate_video_bytes(data, self.max_upload_bytes)
+        except VideoDownloadError as exc:
+            raise VideoAnalysisError(str(exc)) from exc
 
     async def _download_remote(
         self, job: VideoJob
@@ -605,97 +586,9 @@ class VideoAnalysisService:
         self, url: str, source_type: str, workspace: Path
     ) -> tuple[Path | bytes, dict]:
         try:
-            validate_public_url(url)
-        except ValueError as exc:
+            return self.downloader.download_media_stream(url, source_type, workspace)
+        except VideoDownloadError as exc:
             raise VideoAnalysisError(str(exc)) from exc
-
-        try:
-            from yt_dlp import YoutubeDL
-            from yt_dlp.utils import DownloadError
-        except ImportError as exc:
-            raise VideoAnalysisError(
-                "Remote video support requires yt-dlp; install project requirements"
-            ) from exc
-
-        options = {
-            "format": "bestvideo*+bestaudio/best",
-            "merge_output_format": "mp4",
-            "outtmpl": str(workspace / "%(id)s.%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "retries": 2,
-            "fragment_retries": 2,
-            "socket_timeout": 30,
-            "max_filesize": self.max_upload_bytes,
-        }
-        if self.cookies_from_browser:
-            options["cookiesfrombrowser"] = (self.cookies_from_browser,)
-
-        info = None
-        prepared_path = None
-        try:
-            with YoutubeDL(options) as downloader:
-                info = downloader.extract_info(url, download=True)
-                prepared_path = Path(downloader.prepare_filename(info))
-        except Exception as exc:
-            if self.cookies_from_browser:
-                try:
-                    options_no_cookies = dict(options)
-                    options_no_cookies.pop("cookiesfrombrowser", None)
-                    with YoutubeDL(options_no_cookies) as downloader:
-                        info = downloader.extract_info(url, download=True)
-                        prepared_path = Path(downloader.prepare_filename(info))
-                except Exception as inner_exc:
-                    exc = inner_exc
-
-            if info is None:
-                if source_type in {"douyin", "web"}:
-                    return self._download_page_with_browser(
-                        url, source_type, workspace, exc
-                    )
-                raise VideoAnalysisError(
-                    f"{source_type} returned no downloadable public stream. "
-                    "The video may require login cookies, region access, or ffmpeg."
-                ) from exc
-
-        candidates = [prepared_path] if prepared_path.is_file() else []
-        candidates.extend(
-            path
-            for path in workspace.iterdir()
-            if path.is_file()
-            and mimetypes.guess_type(path.name)[0] in SUPPORTED_VIDEO_MIME_TYPES
-        )
-        if not candidates:
-            raise VideoAnalysisError(
-                f"{source_type} returned no downloadable video stream"
-            )
-        path = max(candidates, key=lambda candidate: candidate.stat().st_size)
-        metadata = {
-            key: info.get(key)
-            for key in (
-                "id",
-                "title",
-                "uploader",
-                "duration",
-                "width",
-                "height",
-                "webpage_url",
-                "extractor",
-            )
-            if info.get(key) is not None
-        }
-        metadata["source_type"] = source_type
-
-        # RAM vs ROM Dual-track check: if <= 50MB, read into RAM buffer and unlink file
-        if path.stat().st_size <= 50 * 1024 * 1024:
-            media_bytes = path.read_bytes()
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            return media_bytes, metadata
-        return path, metadata
 
     def _download_page_with_browser(
         self,
@@ -705,149 +598,11 @@ class VideoAnalysisService:
         yt_dlp_error: Exception,
     ) -> tuple[Path | bytes, dict]:
         try:
-            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-            from playwright.sync_api import sync_playwright
-        except ImportError as exc:
-            raise VideoAnalysisError(
-                "The page requires browser extraction and Playwright is not installed"
-            ) from exc
-
-        executable = self._find_browser_executable()
-        if not executable:
-            raise VideoAnalysisError(
-                "The page requires browser extraction and no supported local Chrome/Edge executable was found"
-            ) from yt_dlp_error
-
-        user_agent = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/150.0.0.0 Safari/537.36"
-        )
-        captured_media: list[tuple[str, str, int]] = []
-        best_dom: dict | None = None
-        title = ""
-        final_url = url
-        cookies: dict[str, str] = {}
-
-        try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(
-                    executable_path=str(executable),
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-                try:
-                    context = browser.new_context(
-                        locale="zh-CN",
-                        viewport={"width": 1280, "height": 720},
-                        user_agent=user_agent,
-                    )
-                    page = context.new_page()
-
-                    def on_response(res):
-                        try:
-                            res_url = res.url
-                            ct = (res.headers.get("content-type") or "").lower()
-                            if "uuu_265.mp4" in res_url or res_url.endswith(".js") or res_url.endswith(".css"):
-                                return
-                            if "media-video" in res_url:
-                                captured_media.append((res_url, ct, 10))
-                            elif "douyinvod.com" in res_url:
-                                captured_media.append((res_url, ct, 8))
-                            elif ct.startswith("video/"):
-                                captured_media.append((res_url, ct, 5))
-                        except Exception:
-                            pass
-
-                    page.on("response", on_response)
-                    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-
-                    try:
-                        page.wait_for_function(
-                            """
-                            () => [...document.querySelectorAll('video')].some(
-                              (v) => (v.currentSrc || v.src) && Number.isFinite(v.duration) && v.duration > 3
-                            )
-                            """,
-                            timeout=30_000,
-                        )
-                    except PlaywrightTimeoutError:
-                        time.sleep(2)
-
-                    # Performance API sniffing
-                    perf_urls = page.evaluate(
-                        """
-                        () => performance.getEntriesByType('resource')
-                            .map(e => e.name)
-                            .filter(u => (u.includes('douyinvod.com') || u.includes('media-video') || u.includes('.mp4')) && !u.includes('douyinstatic.com'))
-                        """
-                    )
-                    for pu in perf_urls:
-                        prio = 9 if "media-video" in pu else 7
-                        captured_media.append((pu, "video/mp4", prio))
-
-                    # Inspect DOM video tags
-                    dom_videos = page.evaluate(
-                        """
-                        () => [...document.querySelectorAll('video')].map(v => ({
-                            src: v.currentSrc || v.src || '',
-                            duration: v.duration || 0,
-                            width: v.videoWidth || 0,
-                            height: v.videoHeight || 0
-                        }))
-                        """
-                    )
-                    for dv in dom_videos:
-                        s = dv.get("src", "")
-                        if s and not s.startswith("blob:") and (s.startswith("http://") or s.startswith("https://")):
-                            if not best_dom or dv.get("duration", 0) > best_dom.get("duration", 0):
-                                best_dom = dv
-
-                    title = page.title()
-                    final_url = page.url
-                    cookies = {
-                        cookie["name"]: cookie["value"]
-                        for cookie in context.cookies()
-                    }
-                finally:
-                    browser.close()
-        except PlaywrightTimeoutError as exc:
-            raise VideoAnalysisError(
-                "The page loaded but timed out waiting for playable video stream"
-            ) from exc
-
-        target_media_url = None
-        if captured_media:
-            captured_media.sort(key=lambda item: item[2], reverse=True)
-            target_media_url = captured_media[0][0]
-        elif best_dom and best_dom.get("src"):
-            target_media_url = best_dom["src"]
-
-        if not target_media_url:
-            raise VideoAnalysisError(
-                "The page loaded but no playable public or sniffed video stream was found"
+            return self.downloader._download_page_with_browser(
+                url, source_type, workspace, yt_dlp_error
             )
-
-        metadata = {
-            "title": title,
-            "duration": (best_dom or {}).get("duration"),
-            "width": (best_dom or {}).get("width"),
-            "height": (best_dom or {}).get("height"),
-            "webpage_url": final_url,
-            "extractor": f"{source_type}-browser-sniff",
-            "source_type": source_type,
-            "sniffed_media_url": target_media_url[:120],
-        }
-
-        destination = workspace / f"{source_type}.mp4"
-        media_result = self._fetch_browser_media(
-            target_media_url,
-            destination,
-            cookies=cookies,
-            referer=final_url,
-            user_agent=user_agent,
-        )
-        return media_result, metadata
+        except VideoDownloadError as exc:
+            raise VideoAnalysisError(str(exc)) from exc
 
     def _fetch_browser_media(
         self,
@@ -858,104 +613,20 @@ class VideoAnalysisService:
         referer: str,
         user_agent: str,
     ) -> Path | bytes:
-        current_url = media_url
-        timeout = httpx.Timeout(60, read=self.download_timeout)
-        headers = {"User-Agent": user_agent}
-        if "douyin" in referer or "douyinvod" in media_url:
-            headers["Referer"] = "https://www.douyin.com/"
-        else:
-            headers["Referer"] = referer
-
-        with httpx.Client(
-            follow_redirects=False,
-            timeout=timeout,
-            headers=headers,
-        ) as client:
-            for _ in range(6):
-                try:
-                    validate_public_url(current_url)
-                except ValueError as exc:
-                    raise VideoAnalysisError(str(exc)) from exc
-                with client.stream("GET", current_url, cookies=cookies) as response:
-                    if response.status_code in {301, 302, 303, 307, 308}:
-                        location = response.headers.get("location")
-                        if not location:
-                            raise VideoAnalysisError(
-                                "Video media redirect has no destination"
-                            )
-                        current_url = urljoin(current_url, location)
-                        continue
-                    if response.status_code >= 400:
-                        raise VideoAnalysisError(
-                            f"Video media stream returned HTTP {response.status_code}"
-                        )
-                    content_type = response.headers.get("content-type", "").lower()
-                    if content_type and not (
-                        content_type.startswith("video/")
-                        or "octet-stream" in content_type
-                        or "application/mp4" in content_type
-                    ):
-                        raise VideoAnalysisError(
-                            f"Video media stream returned unexpected content type: {content_type}"
-                        )
-
-                    declared_size = int(response.headers.get("content-length") or 0)
-                    if declared_size > self.max_upload_bytes:
-                        raise VideoAnalysisError(
-                            "Video exceeds the configured upload limit"
-                        )
-
-                    # RAM vs ROM Dual-track streaming
-                    # Threshold: 50MB (50 * 1024 * 1024 bytes)
-                    ram_threshold = 50 * 1024 * 1024
-                    downloaded = 0
-                    buffer = io.BytesIO()
-                    file_handle = None
-
-                    try:
-                        for chunk in response.iter_bytes(1024 * 1024):
-                            downloaded += len(chunk)
-                            if downloaded > self.max_upload_bytes:
-                                raise VideoAnalysisError(
-                                    "Video exceeds the configured upload limit"
-                                )
-                            if file_handle is not None:
-                                file_handle.write(chunk)
-                            else:
-                                buffer.write(chunk)
-                                if downloaded > ram_threshold:
-                                    # Spill over to disk (ROM)
-                                    file_handle = destination.open("wb")
-                                    file_handle.write(buffer.getvalue())
-                                    buffer = None  # Free RAM
-                    finally:
-                        if file_handle is not None:
-                            file_handle.close()
-
-                    if file_handle is not None:
-                        # Video was spilled to disk
-                        self._validate_downloaded_file(destination)
-                        return destination
-                    else:
-                        # Video remains purely in RAM!
-                        data = buffer.getvalue()
-                        self._validate_video_bytes(data)
-                        return data
-
-        raise VideoAnalysisError("Video media stream exceeded the redirect limit")
+        try:
+            return self.downloader._fetch_browser_media(
+                media_url,
+                destination,
+                cookies=cookies,
+                referer=referer,
+                user_agent=user_agent,
+            )
+        except VideoDownloadError as exc:
+            raise VideoAnalysisError(str(exc)) from exc
 
     @staticmethod
     def _find_browser_executable() -> Path | None:
-        configured = os.getenv("VIDEO_BROWSER_EXECUTABLE", "").strip()
-        candidates = [
-            configured,
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        ]
-        return next(
-            (Path(candidate) for candidate in candidates if candidate and Path(candidate).is_file()),
-            None,
-        )
+        return find_browser_executable()
 
     def _mark_failure(self, api_key: str, error: VideoAnalysisError):
         status = error.status_code

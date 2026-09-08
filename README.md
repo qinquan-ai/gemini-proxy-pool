@@ -30,15 +30,27 @@ python main.py
 `ui/components.js` 提供可复用状态与指标组件，`dashboard.js` 只负责数据编排。
 支持明暗主题、手动刷新、自动刷新暂停和移动端表格滚动。
 
-## 配置四个独立项目 Key
+## 配置四个独立项目 Key 与模型推荐
 
 ```env
 GEMINI_KEYS="账号1|AIzaSy...,账号2|AIzaSy...,账号3|AIzaSy...,账号4|AIzaSy..."
-GEMINI_DEFAULT_MODEL="gemini-2.5-flash"
-GEMINI_MODELS="gemini-2.5-flash,gemini-3-flash-preview"
+# 推荐高频/批量默认模型（每日 500 次配额天花板）：
+GEMINI_DEFAULT_MODEL="gemini-3.5-flash-lite"
+GEMINI_MODELS="gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.8-flash,gemini-3.5-flash,gemini-2.5-flash"
 ```
 
 只有当四把 Key 属于四个独立 Cloud Project 时，才可能对应四套项目配额。请遵守 Google 的服务条款和项目配额规则。
+
+### 免费额度分级与选型指南（重要）
+
+Google AI Studio 免费层对不同模型配额差异巨大，选错模型极易触发 429。详见 [全模型官方配额清单](docs/gemini_rate_limits_status.md)：
+
+1. **第一梯队·额度天花板（强烈推荐作为默认模型）**：
+   - **`gemini-3.5-flash-lite`** / **`gemini-3.1-flash-lite`**：**500 RPD (每日 500 次)**，15 RPM，支持多模态与音频，高频对话与批量任务首选。
+2. **第二梯队·旗舰大模型（长文本与复杂多模态）**：
+   - **`gemini-3.8-flash`** / **`gemini-3.5-flash`** / **`gemini-2.5-flash`**：**20 RPD (每日仅 20 次)**，5 RPM，额度较为紧俏，建议留给深度视频分析或关键复杂推理。
+3. **第三梯队·超大并发纯文本**：
+   - **`gemma-4-31b-it`** / **`gemma-4-26b-a4b-it`**：**14,400 RPD (每日 1.44 万次)**，30 RPM，轻量文本任务无限畅享。
 
 ## 安全默认值
 
@@ -223,8 +235,43 @@ Invoke-RestMethod `
 * API 地址填入 `http://localhost:8000/v1`。
 * 密钥填写任意字符，添加对应的模型名即可开始使用。
 
-## 测试
+## 高级运维与自动化 CLI 工具
 
+StudioKey 提供了一套专用的 CLI 工具集，支持可视化配额看板校准、微信式超清长截图和高并发批量视频分析：
+
+### 1. AI Studio 真实配额看板与微信式无缝长截图 (`snapshot`)
+
+自动启动独立可视 Chrome，复用免登 Profile 导航至 Google AI Studio 配额看板，抓取 44 个模型的真实指标并无缝拼接长图：
+
+```powershell
+python -m app.cli snapshot
+```
+
+- **数据作用与核心价值**：
+  1. **基准校准参考 (Reference Benchmark)**：AI Studio 数据通常有 15 分钟延迟，但它是 Google 云端令牌桶最权威的基准，用于校验 StudioKey 本地滑动窗口 Rate Limiter 的准确性。
+  2. **硬指标避让机制 (Hard Quota Avoidance)**：导出的结构化 JSON（`logs/snapshots/ai_studio_quota_*.json`）可直接被代理池流控器读取。当检测到某个模型（例如 `Gemini 2.5 Flash` 达到 80% 警告线）时，调度器自动降低该模型权重，无缝把请求分流至配额充沛的 `Gemini 3 Flash` 或 `Gemini 3.5 Flash`。
+  3. **AI Agent 容量规划 (Agent Capacity Planning)**：AI Agent 批量调度前读取此快照，动态规划并发上限，避免盲目超频导致账号被禁。
+- **产物文件**：
+  - `logs/snapshots/ai_studio_quota_<timestamp>_long.png`：无缝拼接的 6000+ 像素超高清微信式长截图。
+  - `logs/snapshots/ai_studio_quota_<timestamp>.json`：44 个模型结构化 RPM/RPD 指标。
+  - `logs/snapshots/ai_studio_network_rpc_<timestamp>.json`：拦截到的后台 Quota RPC 原生响应包。
+
+### 2. 9 并发极速视频深度分析引擎 (`batch`)
+
+采用“多账号 × 多模型”矩阵调度，以 9 并发全速吞吐分析短视频素材：
+
+```powershell
+python -m app.cli batch --input "data/douyin_search.json" --concurrency 9 --interval 2.0
+```
+
+- **参数说明**：
+  - `--input`：包含视频 URL 或 Aweme 列表的 JSON 文件。
+  - `--concurrency`：并发工作线程数（默认 9 并发，对应 3 个账号 × 3 个主力模型）。
+  - `--interval`：单账号请求保护间隔（默认 2.0 秒，严格恪守 15 RPM 上限）。
+
+---
+
+## 测试
 
 离线单元测试不会调用 Google，也不会消耗 Key：
 
@@ -234,12 +281,5 @@ $env:PYTHONDONTWRITEBYTECODE="1"
 ```
 
 `test_pool.py` 是显式的在线冒烟测试，会真实消耗额度，不属于默认测试流程。
-
-## 下一阶段
-
-1. Files API 视频上传、处理轮询和同 Key 任务亲和
-2. `analyze_video` MCP 工具
-3. 每模型独立的 Key 健康与配额状态
-4. SQLite 指标持久化和重启恢复
 
 许可证：MIT

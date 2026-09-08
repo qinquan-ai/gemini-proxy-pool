@@ -36,13 +36,25 @@ yt-dlp with an isolated headless-Chrome fallback, then verified before Files API
 upload. Job records and completed results are persisted under `data/video_jobs/`;
 temporary media is cleaned after success, failure, or cancellation.
 
-Configure independent project keys:
+Configure independent project keys and recommended models:
 
 ```env
 GEMINI_KEYS="account-1|AIzaSy...,account-2|AIzaSy...,account-3|AIzaSy...,account-4|AIzaSy..."
-GEMINI_DEFAULT_MODEL="gemini-3-flash-preview"
-GEMINI_MODELS="gemini-3-flash-preview"
+# Recommended high-frequency default model (500 RPD free quota ceiling):
+GEMINI_DEFAULT_MODEL="gemini-3.5-flash-lite"
+GEMINI_MODELS="gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.8-flash,gemini-3.5-flash,gemini-2.5-flash"
 ```
+
+### Free Tier Quota Tiers & Selection (Important)
+
+Google AI Studio enforces strict per-model daily limits (RPD) on free keys. See [Full Rate Limit Status Guide](docs/gemini_rate_limits_status.md) for details:
+
+- **Tier 1 (High-Volume Ceiling, Recommended Default)**:
+  - `gemini-3.5-flash-lite` / `gemini-3.1-flash-lite`: **500 RPD (500 requests/day per key)**, 15 RPM. Best choice for general chat, tool calls, and high-frequency tasks.
+- **Tier 2 (Multimodal Flagship & Long Video)**:
+  - `gemini-3.8-flash` / `gemini-3.5-flash` / `gemini-2.5-flash`: **20 RPD (20 requests/day)**, 5 RPM. Reserve for deep reasoning and complex video analysis.
+- **Tier 3 (High-Throughput Pure Text)**:
+  - `gemma-4-31b-it` / `gemma-4-26b-a4b-it`: **14,400 RPD (14.4k requests/day)**, 30 RPM. Ideal for large-scale lightweight text batches.
 
 The server binds to `127.0.0.1` by default. Set a strong `PROXY_API_TOKEN` before changing `PROXY_HOST` to `0.0.0.0`.
 
