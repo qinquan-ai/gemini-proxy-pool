@@ -185,8 +185,8 @@ def main():
     p_recommend = subparsers.add_parser("recommend", help="Recommend optimal model based on remaining quota")
     p_recommend.set_defaults(func=cmd_recommend)
 
-    p_snap = subparsers.add_parser("snapshot", help="Launch visible Chrome (Profile 1) and capture AI Studio quota snapshot")
-    p_snap.add_argument("--profile", default="Profile 1", help="Chrome profile directory (default: Profile 1)")
+    p_snap = subparsers.add_parser("snapshot", help="Launch visible Chrome (default index 0: Default) and capture AI Studio quota snapshot")
+    p_snap.add_argument("--profile", default="0", help="Chrome profile index (0, 1) or directory name (Default, Profile 1), default: 0")
     p_snap.add_argument("--url", help="AI Studio rate limit URL")
     p_snap.add_argument("--wait", type=int, default=8, help="Wait seconds for chart rendering")
     p_snap.add_argument("--output", "-o", help="Custom output image file path")

@@ -13,10 +13,41 @@ import requests
 from playwright.sync_api import sync_playwright
 
 DEFAULT_AI_STUDIO_URL = "https://aistudio.google.com/rate-limit?timeRange=last-1-day&project=gen-lang-client-0386075480"
-DEFAULT_PROFILE = "Profile 1"
+DEFAULT_PROFILE = "Default"  # 默认索引 0 对应的 Chrome 主配置目录
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 USER_DATA_DIR = Path(os.path.expanduser(r"~\AppData\Local\Google\Chrome\User Data"))
 SNAPSHOTS_DIR = Path(__file__).resolve().parent.parent.parent / "logs" / "snapshots"
+
+
+def get_available_chrome_profiles() -> list[str]:
+    """Inspect Chrome Local State to get all profile directories in order."""
+    local_state = USER_DATA_DIR / "Local State"
+    if local_state.exists():
+        try:
+            data = json.loads(local_state.read_text(encoding="utf-8"))
+            cache = data.get("profile", {}).get("info_cache", {})
+            if cache:
+                return list(cache.keys())
+        except Exception:
+            pass
+    # Fallback standard
+    dirs = ["Default"]
+    for p in sorted(USER_DATA_DIR.glob("Profile *")):
+        if p.is_dir() and p.name not in dirs:
+            dirs.append(p.name)
+    return dirs
+
+
+def resolve_profile_name(profile_input: str | int = "0") -> str:
+    """Resolve profile by index (e.g. 0 -> 'Default', 1 -> 'Profile 1') or by direct folder name."""
+    profiles = get_available_chrome_profiles()
+    s = str(profile_input).strip()
+    if s.isdigit():
+        idx = int(s)
+        if 0 <= idx < len(profiles):
+            return profiles[idx]
+        return "Default" if idx == 0 else f"Profile {idx}"
+    return s or "Default"
 
 
 def find_system_chrome() -> str:
@@ -34,11 +65,11 @@ def find_system_chrome() -> str:
 class StudioInspector:
     def __init__(
         self,
-        profile_name: str = DEFAULT_PROFILE,
+        profile_name: str | int = DEFAULT_PROFILE,
         target_url: str = DEFAULT_AI_STUDIO_URL,
         port: int = 9222,
     ):
-        self.profile_name = profile_name
+        self.profile_name = resolve_profile_name(profile_name)
         self.target_url = target_url
         self.port = port
         self.chrome_proc: Optional[subprocess.Popen] = None
