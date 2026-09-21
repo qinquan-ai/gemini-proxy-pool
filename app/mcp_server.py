@@ -12,7 +12,7 @@ mcp = FastMCP(
         "local video files with the shared StudioKey Gemini pool. "
         "Default mode 'general' provides objective audiovisual and narrative analysis. "
         "Modes: 'general' (default content analysis), 'curation' (short drama/video repurposing and watermark scoring), "
-        "'remotion' (Remotion React component plan), 'vox', 'vlog', 'technical', 'transcript'."
+        "'remotion' (Remotion React component plan), 'vox', 'vlog', 'technical', 'transcript', 'transflow_stage1'."
     ),
     stateless_http=True,
     json_response=True,

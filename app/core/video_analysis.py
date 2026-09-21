@@ -5,6 +5,8 @@ import mimetypes
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 import time
 import uuid
 import logging
@@ -13,8 +15,15 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 import httpx
+import json_repair
 
 logger = logging.getLogger(__name__)
+
+# Clean defective no_proxy entries (e.g. ::1 on Windows causing httpx InvalidURL: Invalid port: ':1')
+no_proxy_env = os.environ.get("no_proxy", "")
+if "::1" in no_proxy_env:
+    cleaned = re.sub(r',?::1(?:/\d+)?', '', no_proxy_env).strip(',')
+    os.environ["no_proxy"] = cleaned
 
 from app.core.key_manager import KeyManager
 from app.core.video_sources import VideoSource, parse_video_source, validate_public_url
@@ -37,7 +46,7 @@ SUPPORTED_VIDEO_MIME_TYPES = {
     "video/x-ms-wmv",
     "video/3gpp",
 }
-ANALYSIS_TYPES = {"general", "curation", "remotion", "vox", "vlog", "technical", "transcript"}
+ANALYSIS_TYPES = {"general", "curation", "remotion", "vox", "vlog", "technical", "transcript", "transflow_stage1"}
 
 GENERAL_ANALYSIS_SCHEMA = {
     "type": "object",
@@ -186,6 +195,105 @@ REMOTION_ANALYSIS_SCHEMA = {
     "required": ["summary", "timeline", "reusable_patterns", "remotion_plan"],
 }
 
+# TransFlow Stage 1 出海短视频重构专用结构化契约：字幕 Cue / 特殊标记点 / 分镜，均带真实毫秒时间戳
+TRANSFLOW_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "duration_s": {"type": "number"},
+        "cues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "start_ms": {"type": "integer"},
+                    "end_ms": {"type": "integer"},
+                    "zh_text": {"type": "string"},
+                    "en_text": {"type": "string"},  # 英文翻译
+                    "is_narrator": {"type": "boolean"},  # 影视解说旁白标记
+                    "speaker": {"type": "string"},  # 短剧角色名
+                    "bbox": {
+                        "type": "object",
+                        "properties": {
+                            "ymin": {"type": "number"},
+                            "xmin": {"type": "number"},
+                            "ymax": {"type": "number"},
+                            "xmax": {"type": "number"},
+                        },
+                    },
+                    "confidence": {"type": "number"},
+                },
+                "required": ["id", "start_ms", "end_ms", "zh_text"],
+            },
+        },
+        "special_points": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "point_type": {"type": "string"},
+                    "start_s": {"type": "number"},
+                    "end_s": {"type": "number"},
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["id", "point_type", "start_s", "end_s"],
+            },
+        },
+        "scenes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "scene_index": {"type": "integer"},
+                    "start_s": {"type": "number"},
+                    "end_s": {"type": "number"},
+                    "visual_description": {"type": "string"},
+                    "content_safety": {
+                        "type": "string",
+                        "enum": ["safe_for_flip", "has_face", "has_text", "unknown"]
+                    },
+                    "dedup_action": {
+                        "type": "object",
+                        "properties": {
+                            "scale_factor": {
+                                "type": "number",
+                                "minimum": 1.035,
+                                "maximum": 1.065,
+                                "description": "空间微缩放系数，正脸镜头选小值(1.035-1.04)，环境镜头选大值(1.055-1.065)"
+                            },
+                            "stretch_y": {
+                                "type": "number",
+                                "minimum": 1.03,
+                                "maximum": 1.08,
+                                "description": "纵向拉伸系数"
+                            },
+                            "speed": {
+                                "type": "number",
+                                "minimum": 1.015,
+                                "maximum": 1.035,
+                                "description": "微变速系数"
+                            },
+                            "allow_flip": {
+                                "type": "boolean",
+                                "description": "是否允许水平翻转（检测到正脸/文字则为false）"
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "AI判断依据：为什么选择这些参数"
+                            }
+                        },
+                        "required": ["scale_factor", "stretch_y", "speed", "allow_flip", "reason"]
+                    }
+                },
+                "required": ["scene_index", "start_s", "end_s", "visual_description", "content_safety", "dedup_action"]
+            }
+        },
+    },
+    "required": ["duration_s", "cues"],
+}
+
 # Alias for backwards compatibility
 ANALYSIS_SCHEMA = REMOTION_ANALYSIS_SCHEMA
 
@@ -197,6 +305,7 @@ STYLE_INSTRUCTIONS = {
     "vlog": "Prioritize story beats, A-roll/B-roll, jump cuts, captions, music, ambience, and reusable creator effects.",
     "technical": "Prioritize teaching structure, screen recordings, code emphasis, diagrams, callouts, and information density.",
     "transcript": "Prioritize timestamped speech, speaker changes, on-screen text, and visible event synchronization.",
+    "transflow_stage1": "Follow the caller-supplied TransFlow prompt exactly as the complete instruction set; do not add extra commentary.",
 }
 
 
@@ -243,6 +352,41 @@ async def _file_chunks(path: Path, chunk_size: int = 1024 * 1024):
             yield chunk
     finally:
         await asyncio.to_thread(handle.close)
+
+
+def probe_video_duration(path: Path) -> float:
+    """使用 ffprobe 快速获取视频时长 (秒)"""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path)
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if res.returncode == 0 and res.stdout.strip():
+            return float(res.stdout.strip())
+    except Exception:
+        pass
+    return 0.0
+
+
+def fast_compress_video(src: Path, dst: Path, max_width: int = 960, fps: int = 15) -> bool:
+    """快速压缩视频用于多模态视觉理解：960宽、15fps、CRF=30、音频64k"""
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-vf", f"scale='min({max_width},iw)':-2",
+            "-r", str(fps),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+            "-c:a", "aac", "-b:a", "64k",
+            str(dst)
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return res.returncode == 0 and dst.exists() and dst.stat().st_size > 0
+    except Exception as e:
+        logger.warning(f"Video compression failed: {e}")
+        return False
 
 
 class VideoAnalysisService:
@@ -292,6 +436,7 @@ class VideoAnalysisService:
         model: str = "gemini-3.5-flash-lite",
         archive_dir: str | None = None,
         save_threshold: float = 7.0,
+        source_metadata: dict | None = None,
     ) -> dict:
         if analysis_type not in ANALYSIS_TYPES:
             raise VideoAnalysisError(f"analysis_type must be one of: {', '.join(sorted(ANALYSIS_TYPES))}")
@@ -307,6 +452,7 @@ class VideoAnalysisService:
             resolved_source=source_info.value,
             archive_dir=archive_dir,
             save_threshold=save_threshold,
+            source_metadata=source_metadata,
         )
         self.jobs[job.id] = job
         self._persist(job)
@@ -386,6 +532,7 @@ class VideoAnalysisService:
         key_finalized = False
         temporary_directory: Path | None = None
         file_name: str | None = None
+        temp_compressed_path: Path | None = None
         try:
             mime_type = "video/mp4"
             source_path: Path | None = None
@@ -413,6 +560,47 @@ class VideoAnalysisService:
                 self._validate_video_bytes(video_bytes)
                 mime_type = "video/mp4"
 
+            temp_compressed_path: Path | None = None
+            if source_path is not None and source_path.is_file():
+                file_size = source_path.stat().st_size
+                duration = None
+                if job.source_metadata and isinstance(job.source_metadata, dict):
+                    raw_dur = job.source_metadata.get("duration") or job.source_metadata.get("duration_s")
+                    if raw_dur is not None:
+                        try:
+                            duration = float(raw_dur)
+                        except (ValueError, TypeError):
+                            duration = None
+                if duration is None:
+                    duration = probe_video_duration(source_path)
+                # 当视频超过 50MB 或超过 10 分钟 (600s) 时，进行视觉与OCR无损的快速下采样预压缩，大幅提速上传和 Gemini Active 预转码
+                if file_size > 50 * 1024 * 1024 or duration > 600.0:
+                    logger.info(
+                        "[AUTO_COMPRESS] 视频文件较大 (size=%.1fMB, duration=%.1fs)，启动快速预压缩优化传输...",
+                        file_size / (1024 * 1024),
+                        duration,
+                    )
+                    self._update(job, "compressing", 0.10)
+                    temp_dir = Path(tempfile.gettempdir())
+                    c_path = temp_dir / f"compressed_{uuid.uuid4().hex[:8]}_{source_path.name}"
+                    if await asyncio.to_thread(fast_compress_video, source_path, c_path):
+                        c_size = c_path.stat().st_size
+                        logger.info(
+                            "[AUTO_COMPRESS] 预压缩完成: %.1fMB -> %.1fMB (压缩率 %.1f%%)",
+                            file_size / (1024 * 1024),
+                            c_size / (1024 * 1024),
+                            (1 - c_size / file_size) * 100,
+                        )
+                        temp_compressed_path = c_path
+
+            upload_media = (
+                temp_compressed_path
+                if temp_compressed_path is not None
+                else (source_path if source_path is not None else video_bytes)
+            )
+            if temp_compressed_path is not None:
+                mime_type = "video/mp4"
+
             max_key_attempts = max(1, len(self.key_pool.keys))
             last_key_error: Exception | None = None
 
@@ -425,7 +613,7 @@ class VideoAnalysisService:
                 key_finalized = False
 
                 try:
-                    file_to_upload = source_path if source_path is not None else video_bytes
+                    file_to_upload = upload_media
                     if file_to_upload is not None:
                         self._update(job, "uploading", 0.15)
                         file_info = await self._upload(
@@ -441,8 +629,79 @@ class VideoAnalysisService:
                         mime_type = file_info.get("mimeType", mime_type)
                     else:
                         job.file_uri = job.source
-                    self._update(job, "analyzing", 0.55)
-                    job.result = await self._analyze(job, mime_type, api_key)
+                    # Model Fallback Tier: 当遇到 503 / High Demand 时，自动降级
+                    # 策略：优先保持 500 RPD 的 lite 系列 → 同代 20 RPD 标准版 / 备选版
+                    fallback_models = [job.model]
+                    if job.model == "gemini-3.5-flash-lite":
+                        fallback_models.extend([
+                            "gemini-3.1-flash-lite",   # ✅ 同是 500 RPD 的 lite 版本
+                            "gemini-2.5-flash-lite",   # ✅ 保持 lite（降到 20 RPD）
+                            "gemini-2.5-flash",        # ✅ 稳定多模态标准版
+                            "gemini-3.5-flash",        # ✅ 多模态标准版
+                            "gemini-3.8-flash",        # ✅ 旗舰版
+                        ])
+                    elif job.model == "gemini-3.1-flash-lite":
+                        fallback_models.extend([
+                            "gemini-3.5-flash-lite",   # 互相备份 (500 RPD)
+                            "gemini-2.5-flash-lite",
+                            "gemini-2.5-flash",
+                            "gemini-3.5-flash",
+                            "gemini-3.8-flash",
+                        ])
+                    elif job.model == "gemini-2.5-flash":
+                        fallback_models.extend([
+                            "gemini-3.5-flash-lite",   # 高配额 lite
+                            "gemini-3.1-flash-lite",
+                            "gemini-2.5-flash-lite",
+                            "gemini-3.5-flash",
+                            "gemini-3.8-flash",
+                        ])
+                    elif job.model == "gemini-3.8-flash":
+                        fallback_models.extend([
+                            "gemini-3.5-flash-lite",
+                            "gemini-3.1-flash-lite",
+                            "gemini-2.5-flash",
+                            "gemini-3.5-flash",
+                            "gemini-2.5-flash-lite",
+                        ])
+                    else:
+                        fallback_models.extend([
+                            "gemini-3.5-flash-lite",
+                            "gemini-3.1-flash-lite",
+                            "gemini-2.5-flash",
+                        ])
+
+                    # 保留原序去重
+                    seen_models = set()
+                    fallback_models = [m for m in fallback_models if not (m in seen_models or seen_models.add(m))]
+
+                    analyze_error = None
+                    for m_idx, m_name in enumerate(fallback_models):
+                        job.model = m_name
+                        try:
+                            self._update(job, "analyzing", 0.55)
+                            job.result = await self._analyze(job, mime_type, api_key)
+                            analyze_error = None
+                            break
+                        except VideoAnalysisError as v_err:
+                            is_high_demand = (
+                                v_err.status_code == 503
+                                or "high demand" in str(v_err).lower()
+                                or "temporarily unavailable" in str(v_err).lower()
+                            )
+                            if is_high_demand and m_idx < len(fallback_models) - 1:
+                                next_m = fallback_models[m_idx + 1]
+                                logger.warning(
+                                    "[MODEL_FAILOVER] 模型 %s 遇到官方服务拥挤 (503 High Demand)，自动切换至备选模型 %s...",
+                                    m_name,
+                                    next_m,
+                                )
+                                await asyncio.sleep(1.5)
+                                continue
+                            analyze_error = v_err
+                            break
+                    if analyze_error:
+                        raise analyze_error
 
                     # Auto-archive funnel for curation or explicit archive_dir
                     if job.archive_dir:
@@ -489,7 +748,7 @@ class VideoAnalysisService:
                     self._mark_failure(api_key, exc)
                     key_finalized = True
                     last_key_error = exc
-                    if exc.status_code in {401, 403, 429} and attempt < max_key_attempts - 1:
+                    if exc.status_code in {401, 403, 429, 503} and attempt < max_key_attempts - 1:
                         logger.warning(
                             "Key %s failed with %s, failing over to next key (attempt %d/%d)",
                             job.key_name,
@@ -532,6 +791,11 @@ class VideoAnalysisService:
                 await asyncio.to_thread(
                     shutil.rmtree, temporary_directory, ignore_errors=True
                 )
+            if temp_compressed_path and temp_compressed_path.exists():
+                try:
+                    temp_compressed_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
             if file_name and api_key:
                 try:
                     await self.client.delete(
@@ -659,6 +923,12 @@ class VideoAnalysisService:
             file_name = display_name or media.name
             content = _file_chunks(media)
 
+        size_mb = size / (1024 * 1024)
+        logger.info(
+            "video.upload.start file=%s size_bytes=%d size_mb=%.2f mime=%s",
+            file_name, size, size_mb, mime_type,
+        )
+
         start = await self.client.post(
             "https://generativelanguage.googleapis.com/upload/v1beta/files",
             headers={
@@ -670,11 +940,15 @@ class VideoAnalysisService:
                 "Content-Type": "application/json",
             },
             json={"file": {"display_name": file_name}},
+            timeout=httpx.Timeout(60.0),
         )
         self._raise_for_google(start, "start video upload")
         upload_url = start.headers.get("x-goog-upload-url")
         if not upload_url:
             raise VideoAnalysisError("Files API returned no upload URL")
+        # 大文件上传需要更长的超时时间（默认 180s 太短）
+        upload_timeout = httpx.Timeout(600.0)  # 10 分钟
+        upload_start_ts = time.monotonic()
         uploaded = await self.client.post(
             upload_url,
             headers={
@@ -683,10 +957,19 @@ class VideoAnalysisService:
                 "X-Goog-Upload-Command": "upload, finalize",
             },
             content=content,
+            timeout=upload_timeout,
         )
+        upload_elapsed = time.monotonic() - upload_start_ts
         self._raise_for_google(uploaded, "upload video")
         data = uploaded.json()
-        return data.get("file", data)
+        file_meta = data.get("file", data)
+        logger.info(
+            "video.upload.done file=%s elapsed_seconds=%.2f throughput_mbps=%.2f",
+            file_name,
+            upload_elapsed,
+            size_mb / upload_elapsed if upload_elapsed > 0 else 0.0,
+        )
+        return file_meta
 
     async def _wait_until_active(self, file_name: str, api_key: str, job: VideoJob) -> dict:
         deadline = time.monotonic() + self.processing_timeout
@@ -707,10 +990,18 @@ class VideoAnalysisService:
         raise VideoAnalysisError("Timed out waiting for Gemini video processing")
 
     async def _analyze(self, job: VideoJob, mime_type: str, api_key: str) -> dict:
+        """
+        分析视频（支持流式输出）
+        
+        流式输出会实时追加到 {job.id}_stream.log，用户可以看到 AI 正在生成的内容。
+        最终仍然一次性解析完整 JSON。
+        """
         if job.analysis_type == "remotion":
             schema = REMOTION_ANALYSIS_SCHEMA
         elif job.analysis_type == "curation":
             schema = CURATION_ANALYSIS_SCHEMA
+        elif job.analysis_type == "transflow_stage1":
+            schema = TRANSFLOW_ANALYSIS_SCHEMA
         else:
             schema = GENERAL_ANALYSIS_SCHEMA
 
@@ -719,32 +1010,138 @@ class VideoAnalysisService:
                 {"fileData": {"fileUri": job.file_uri, "mimeType": mime_type}},
                 {"text": self._prompt(job.analysis_type, job.prompt)},
             ]}],
-            "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema, "temperature": 0.2},
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": schema,
+                "temperature": 0.2,
+                "maxOutputTokens": 65536,  # 允许长视频输出大量字幕和分镜
+            },
         }
-        response = await self.client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{job.model}:generateContent",
-            headers={"x-goog-api-key": api_key}, json=payload,
-        )
-        self._raise_for_google(response, "analyze video")
-        data = response.json()
-        candidates = data.get("candidates", [])
-        if not candidates:
-            raise VideoAnalysisError("Gemini returned no video analysis candidate")
-        text = "".join(part.get("text", "") for part in candidates[0].get("content", {}).get("parts", [])).strip()
-        if text.startswith("```json"):
-            text = text[7:].removesuffix("```").strip()
+        
+        # 使用流式端点
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{job.model}:streamGenerateContent?alt=sse"
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+        
+        # 准备流式日志文件
+        stream_log_file = self.job_dir / f"{job.id}_stream.log"
+        chunks = []
+        chunks_count = 0
+        
         try:
-            result = json.loads(text)
-        except ValueError as exc:
-            raise VideoAnalysisError(f"Gemini returned invalid structured analysis: {exc}") from exc
-        result["gateway_metadata"] = {
-            "job_id": job.id, "model": job.model, "analysis_type": job.analysis_type,
-            "file_uri": job.file_uri, "key_name": job.key_name, "usage": data.get("usageMetadata", {}),
-        }
-        return result
+            async with self.client.stream("POST", url, headers=headers, json=payload, timeout=600.0) as response:
+                response.raise_for_status()
+                
+                async for line in response.aiter_lines():
+                    if not line.strip():
+                        continue
+                    
+                    if line.startswith("data: "):
+                        chunk_data = line[6:]  # 去掉 "data: " 前缀
+                        
+                        try:
+                            chunk = json.loads(chunk_data)
+                            candidates = chunk.get("candidates", [])
+                            if not candidates:
+                                continue
+                            
+                            content = candidates[0].get("content", {})
+                            parts = content.get("parts", [])
+                            finish_reason = candidates[0].get("finishReason")
+                            
+                            # 提取文本片段
+                            for part in parts:
+                                if "text" in part:
+                                    text_chunk = part["text"]
+                                    chunks.append(text_chunk)
+                                    chunks_count += 1
+                                    
+                                    # 实时写入流式日志
+                                    with open(stream_log_file, "a", encoding="utf-8") as f:
+                                        f.write(text_chunk)
+                                    
+                                    # 更新进度（analyzing: 0.55 → 0.95）
+                                    # 假设平均 50-100 个 chunks，进度逐步增长
+                                    progress = min(0.95, 0.55 + (chunks_count / 100) * 0.4)
+                                    self._update(job, "analyzing", progress)
+                            
+                            # 如果完成，退出循环
+                            if finish_reason:
+                                logger.info(f"Stream finished for job {job.id}, reason: {finish_reason}, chunks: {chunks_count}")
+                                break
+                                
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Failed to parse stream chunk for job {job.id}: {e}")
+                            continue
+            
+            # 拼接完整文本
+            full_text = "".join(chunks).strip()
+            if not full_text:
+                raise VideoAnalysisError("Gemini returned empty response via stream")
+            
+            # 去除可能的 markdown 代码块标记
+            if full_text.startswith("```json"):
+                full_text = full_text[7:].removesuffix("```").strip()
+            
+            # 解析 JSON
+            try:
+                result = json.loads(full_text)
+            except ValueError as exc:
+                # Gemini 长 JSON 容错：尝试修复常见格式错误
+                try:
+                    fixed_text = self._attempt_json_repair(full_text)
+                    result = json.loads(fixed_text)
+                    logger.warning(f"JSON repair succeeded for job {job.id}, original error: {exc}")
+                except (ValueError, Exception) as repair_exc:
+                    # 保存原始文本用于调试
+                    debug_file = self.job_dir / f"{job.id}_debug_response.json"
+                    debug_file.write_text(full_text, encoding="utf-8")
+                    raise VideoAnalysisError(f"Gemini returned invalid structured analysis: {exc}") from exc
+            
+            # 添加元数据（注意：流式输出没有 usageMetadata，需要从最后一个 chunk 获取）
+            result["gateway_metadata"] = {
+                "job_id": job.id, 
+                "model": job.model, 
+                "analysis_type": job.analysis_type,
+                "file_uri": job.file_uri, 
+                "key_name": job.key_name, 
+                "stream_chunks": chunks_count,
+                "stream_log": str(stream_log_file),
+            }
+            
+            return result
+            
+        except httpx.HTTPStatusError as e:
+            try:
+                await e.response.aread()
+            except Exception:
+                pass
+            self._raise_for_google(e.response, "analyze video (stream)")
+            raise  # 永远不会到达，_raise_for_google 总是抛出异常
+
+    @staticmethod
+    def _attempt_json_repair(text: str) -> str:
+        """尝试修复 Gemini 返回的格式错误的 JSON（缺少逗号、多余逗号、未闭合括号等）"""
+        try:
+            # 使用 json_repair 库自动修复常见 JSON 格式错误
+            repaired = json_repair.repair_json(text)
+            return repaired
+        except Exception as e:
+            # 如果自动修复失败，尝试简单的正则修复
+            logger.debug(f"json_repair failed: {e}, trying regex fallback")
+            # 修复缺少逗号的情况：}{ -> },{  或  ][ -> ],[
+            text = re.sub(r'}\s*{', '},{', text)
+            text = re.sub(r']\s*\[', '],[', text)
+            # 修复对象/数组末尾多余逗号：, } -> }  或  , ] -> ]
+            text = re.sub(r',\s*}', '}', text)
+            text = re.sub(r',\s*]', ']', text)
+            return text
 
     @staticmethod
     def _prompt(analysis_type: str, custom_prompt: str | None) -> str:
+        if analysis_type == "transflow_stage1" and custom_prompt:
+            # TransFlow 侧已经准备好完整的结构化指令模板 (含时间戳/毫秒/坐标契约要求)，
+            # 网关不再叠加通用指令，直接白盒透传，避免污染既定的 JSON 契约。
+            return custom_prompt
         base = (
             "Analyze the complete video using visual and audio evidence. Use MM:SS timestamps. "
             "Separate observed facts from uncertain inference. Return JSON only. "
@@ -756,8 +1153,13 @@ class VideoAnalysisService:
     def _raise_for_google(response: httpx.Response, action: str):
         if response.status_code < 400:
             return
+        message = None
         try:
-            message = response.json().get("error", {}).get("message")
-        except ValueError:
+            raw = getattr(response, "_content", None)
+            if raw:
+                message = json.loads(raw.decode("utf-8", errors="ignore")).get("error", {}).get("message")
+            elif hasattr(response, "text"):
+                message = response.json().get("error", {}).get("message")
+        except Exception:
             message = None
         raise VideoAnalysisError(f"Unable to {action}: {message or f'HTTP {response.status_code}'}", response.status_code)

@@ -12,6 +12,12 @@ import httpx
 
 from app.core.video_sources import parse_video_source, validate_public_url
 
+# Clean defective no_proxy entries (e.g. ::1 on Windows causing httpx InvalidURL: Invalid port: ':1')
+no_proxy_env = os.environ.get("no_proxy", "")
+if "::1" in no_proxy_env:
+    cleaned = re.sub(r',?::1(?:/\d+)?', '', no_proxy_env).strip(',')
+    os.environ["no_proxy"] = cleaned
+
 SUPPORTED_VIDEO_MIME_TYPES = {
     "video/mp4",
     "video/webm",
@@ -245,20 +251,40 @@ class VideoDownloader:
         final_url = url
         cookies: dict[str, str] = {}
 
+        TIKTOK_PROFILE = Path(r"D:\project_qin\Video_project\TikTok\tiktok_browser\data\browser_profile")
+        profile_dir = TIKTOK_PROFILE if TIKTOK_PROFILE.exists() else (workspace.parent / "data" / "browser_profile")
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        headless_env = os.getenv("VIDEO_BROWSER_HEADLESS", "false").strip().lower()
+        headless = headless_env in {"true", "1", "yes"}
+
         try:
             with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(
-                    executable_path=str(executable),
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
+                args = [
+                    "--start-maximized",
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ]
+                kwargs = {
+                    "user_data_dir": str(profile_dir),
+                    "headless": headless,
+                    "args": args,
+                    "locale": "zh-CN",
+                    "user_agent": user_agent,
+                }
+                if executable:
+                    kwargs["executable_path"] = str(executable)
+
+                context = playwright.chromium.launch_persistent_context(**kwargs)
                 try:
-                    context = browser.new_context(
-                        locale="zh-CN",
-                        viewport={"width": 1280, "height": 720},
-                        user_agent=user_agent,
-                    )
-                    page = context.new_page()
+                    page = context.pages[0] if context.pages else context.new_page()
+
+                    # Anti-detect script
+                    page.add_init_script("""
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        window.navigator.chrome = { runtime: {} };
+                    """)
 
                     def on_response(res):
                         try:
@@ -326,7 +352,7 @@ class VideoDownloader:
                         for cookie in context.cookies()
                     }
                 finally:
-                    browser.close()
+                    context.close()
         except PlaywrightTimeoutError as exc:
             raise VideoDownloadError(
                 "The page loaded but timed out waiting for playable video stream"
@@ -386,6 +412,7 @@ class VideoDownloader:
             follow_redirects=False,
             timeout=timeout,
             headers=headers,
+            trust_env=False,
         ) as client:
             for _ in range(6):
                 try:

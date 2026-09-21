@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 from app.core.key_manager import KeyManager
 from app.core.responses_adapter import (
@@ -489,14 +490,38 @@ async def healthz():
     }
 
 
+_OFFICIAL_MODELS_CACHE = {"models": [], "cached_at": 0.0}
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
     require_proxy_auth(request)
+    now = time.time()
+    # Cache for 10 minutes
+    if not _OFFICIAL_MODELS_CACHE["models"] or (now - _OFFICIAL_MODELS_CACHE["cached_at"] > 600):
+        key_info = key_pool.acquire_key()
+        if key_info:
+            api_key = key_info["key"]
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}")
+                    if resp.status_code == 200:
+                        raw_models = resp.json().get("models", [])
+                        official_ids = [m["name"].replace("models/", "") for m in raw_models]
+                        _OFFICIAL_MODELS_CACHE["models"] = official_ids
+                        _OFFICIAL_MODELS_CACHE["cached_at"] = now
+            except Exception as e:
+                logger.warning("Failed to fetch official models from Google, falling back to local list: %s", e)
+            finally:
+                key_pool.release(api_key)
+
+    # Merge official models with AVAILABLE_MODELS, preserving order and uniqueness
+    model_ids = list(dict.fromkeys((_OFFICIAL_MODELS_CACHE["models"] or []) + AVAILABLE_MODELS))
     return {
         "object": "list",
         "data": [
             {"id": model, "object": "model", "owned_by": "google"}
-            for model in AVAILABLE_MODELS
+            for model in model_ids
         ],
     }
 
@@ -551,6 +576,171 @@ async def get_status():
 @app.get("/stats/quota")
 async def get_quota_details():
     return JSONResponse(content=key_pool.get_quota_status())
+
+
+class VideoAnalyzeRequest(BaseModel):
+    source: str
+    analysis_type: str = "general"
+    prompt: str | None = None
+    model: str = DEFAULT_MODEL
+    archive_dir: str | None = None
+    save_threshold: float = 7.0
+    source_metadata: dict | None = None
+
+
+@app.post("/v1/video/analyze")
+async def submit_video_analyze(request: Request, body: VideoAnalyzeRequest):
+    """提交一个真实原生视频分析任务 (Gemini Files API 完整视频上传+理解，非抽帧)。
+    立即返回 job_id，调用方需轮询 GET /v1/video/jobs/{job_id} 获取进度与结果。"""
+    require_proxy_auth(request)
+    video_service: VideoAnalysisService = request.app.state.video_service
+    try:
+        return JSONResponse(content=await video_service.submit(
+            source=body.source,
+            analysis_type=body.analysis_type,
+            prompt=body.prompt,
+            model=body.model,
+            archive_dir=body.archive_dir,
+            save_threshold=body.save_threshold,
+            source_metadata=body.source_metadata,
+        ))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/v1/video/jobs/{job_id}")
+async def get_video_job(request: Request, job_id: str):
+    """轮询获取视频分析任务的实时阶段 (queued/downloading/uploading/processing/analyzing/completed/failed) 与结果。"""
+    require_proxy_auth(request)
+    video_service: VideoAnalysisService = request.app.state.video_service
+    try:
+        return JSONResponse(content=video_service.get(job_id))
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.delete("/v1/video/jobs/{job_id}")
+async def cancel_video_job(request: Request, job_id: str):
+    """显式取消正在运行的视频分析任务，释放 API 资源并清理服务端临时文件。"""
+    require_proxy_auth(request)
+    video_service: VideoAnalysisService = request.app.state.video_service
+    try:
+        return JSONResponse(content=await video_service.cancel(job_id))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/v1/video/analyze/stream/{job_id}")
+async def stream_video_job(request: Request, job_id: str):
+    """SSE 流式推送视频分析任务的实时阶段变化、Token 推流与最终结果。
+
+    通过 Server-Sent Events 实时广播：
+    - stage_update: 阶段与进度百分比变化
+    - stream_chunk: 大模型生成的实时文本片段 (直接端到端推流)
+    - completed: 分析完成与最终完整结果 JSON
+    - ping: 10 秒心跳保活，防止底层连接静默断开
+    """
+    require_proxy_auth(request)
+    video_service: VideoAnalysisService = request.app.state.video_service
+
+    try:
+        job = video_service.get(job_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    async def event_generator():
+        last_stage = None
+        last_progress = -1.0
+        last_ping_time = time.time()
+        stream_bytes_read = 0
+        stream_file = video_service.job_dir / f"{job_id}_stream.log"
+
+        while True:
+            try:
+                if await request.is_disconnected():
+                    break
+
+                job = video_service.get(job_id)
+                stage = job.get("stage", "")
+                status = job.get("status", "")
+                progress = float(job.get("progress") or 0.0)
+
+                # 1. 阶段或显著进度变更广播
+                should_push_stage = (stage != last_stage) or (abs(progress - last_progress) >= 0.02)
+                if should_push_stage:
+                    event_data = {
+                        "event": "stage_update",
+                        "stage": stage,
+                        "status": status,
+                        "progress": round(progress, 3),
+                        "timestamp": time.time(),
+                    }
+                    yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+                    last_stage = stage
+                    last_progress = progress
+                    last_ping_time = time.time()
+
+                # 2. 实时捕获并推送大模型 stream.log 新增生成的 token 片段
+                if stream_file.exists():
+                    try:
+                        file_size = stream_file.stat().st_size
+                        if file_size > stream_bytes_read:
+                            with open(stream_file, "r", encoding="utf-8", errors="ignore") as f:
+                                f.seek(stream_bytes_read)
+                                new_chunk = f.read()
+                                stream_bytes_read = f.tell()
+                            if new_chunk:
+                                chunk_event = {
+                                    "event": "stream_chunk",
+                                    "chunk": new_chunk,
+                                    "timestamp": time.time(),
+                                }
+                                yield f"data: {json.dumps(chunk_event, ensure_ascii=False)}\n\n"
+                                last_ping_time = time.time()
+                    except Exception:
+                        pass
+
+                # 3. 最终完成或失败状态广播
+                if status == "completed":
+                    final_event = {
+                        "event": "completed",
+                        "result": job.get("result"),
+                        "timestamp": time.time(),
+                    }
+                    yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
+                    break
+                elif status in {"failed", "cancelled"}:
+                    fail_event = {
+                        "event": status,
+                        "error": job.get("error", ""),
+                        "timestamp": time.time(),
+                    }
+                    yield f"data: {json.dumps(fail_event, ensure_ascii=False)}\n\n"
+                    break
+
+                # 4. 心跳保活 (每 10 秒无输出则推送 SSE ping 注释)
+                if time.time() - last_ping_time >= 10.0:
+                    yield ": ping\n\n"
+                    last_ping_time = time.time()
+
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.exception("[SSE_STREAM] Exception in event_generator: %s", e)
+                error_event = {"event": "error", "message": str(e)}
+                yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+                break
+
+        yield "data: {\"event\": \"done\"}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.post("/v1/chat/completions")
