@@ -43,12 +43,15 @@ class ParallelVideoAnalyzer:
         self.concurrency_per_key = max(1, concurrency_per_key)
         self.inter_request_delay = inter_request_delay
         self.preferred_models = [
-            "gemini-2.5-flash",
-            "gemini-3-flash-preview",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
             "gemini-3.5-flash",
-            "gemini-flash-latest",
+            "gemini-2.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
             "gemini-2.5-flash-lite",
-            "gemini-flash-lite-latest",
+            "gemini-flash-latest",
         ]
 
     def partition_tasks(self, tasks: List[VideoTask]) -> Dict[str, List[VideoTask]]:

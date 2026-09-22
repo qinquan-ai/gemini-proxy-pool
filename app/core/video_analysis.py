@@ -195,11 +195,53 @@ REMOTION_ANALYSIS_SCHEMA = {
     "required": ["summary", "timeline", "reusable_patterns", "remotion_plan"],
 }
 
-# TransFlow Stage 1 出海短视频重构专用结构化契约：字幕 Cue / 特殊标记点 / 分镜，均带真实毫秒时间戳
+# TransFlow Stage 1 出海短视频重构专用结构化契约：四权分立（字幕带 / 画中字 / 对白Cue / 物理标记点 / 分镜）
 TRANSFLOW_ANALYSIS_SCHEMA = {
     "type": "object",
     "properties": {
         "duration_s": {"type": "number"},
+        "content_type": {"type": "string"},
+        "chinese_subtitle_band": {
+            "type": "object",
+            "properties": {
+                "detected": {"type": "boolean"},
+                "ymin": {"type": "number"},
+                "xmin": {"type": "number"},
+                "ymax": {"type": "number"},
+                "xmax": {"type": "number"},
+                "confidence": {"type": "number"},
+                "description": {"type": "string"},
+            },
+            "required": ["detected"],
+        },
+        "in_screen_titles": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "start_ms": {"type": "integer"},
+                    "end_ms": {"type": "integer"},
+                    "zh_text": {"type": "string"},
+                    "en_text": {"type": "string"},
+                    "category": {
+                        "type": "string",
+                        "enum": ["title", "sticker_text", "floating_dialog", "scene_text"],
+                    },
+                    "bbox": {
+                        "type": "object",
+                        "properties": {
+                            "ymin": {"type": "number"},
+                            "xmin": {"type": "number"},
+                            "ymax": {"type": "number"},
+                            "xmax": {"type": "number"},
+                        },
+                        "required": ["ymin", "xmin", "ymax", "xmax"],
+                    },
+                },
+                "required": ["id", "start_ms", "end_ms", "zh_text", "en_text", "category", "bbox"],
+            },
+        },
         "cues": {
             "type": "array",
             "items": {
@@ -209,21 +251,12 @@ TRANSFLOW_ANALYSIS_SCHEMA = {
                     "start_ms": {"type": "integer"},
                     "end_ms": {"type": "integer"},
                     "zh_text": {"type": "string"},
-                    "en_text": {"type": "string"},  # 英文翻译
+                    "en_text": {"type": "string"},  # 英文本土化翻译
                     "is_narrator": {"type": "boolean"},  # 影视解说旁白标记
                     "speaker": {"type": "string"},  # 短剧角色名
-                    "bbox": {
-                        "type": "object",
-                        "properties": {
-                            "ymin": {"type": "number"},
-                            "xmin": {"type": "number"},
-                            "ymax": {"type": "number"},
-                            "xmax": {"type": "number"},
-                        },
-                    },
                     "confidence": {"type": "number"},
                 },
-                "required": ["id", "start_ms", "end_ms", "zh_text"],
+                "required": ["id", "start_ms", "end_ms", "zh_text", "en_text"],
             },
         },
         "special_points": {
@@ -237,6 +270,15 @@ TRANSFLOW_ANALYSIS_SCHEMA = {
                     "end_s": {"type": "number"},
                     "title": {"type": "string"},
                     "description": {"type": "string"},
+                    "bbox": {
+                        "type": "object",
+                        "properties": {
+                            "ymin": {"type": "number"},
+                            "xmin": {"type": "number"},
+                            "ymax": {"type": "number"},
+                            "xmax": {"type": "number"},
+                        },
+                    },
                 },
                 "required": ["id", "point_type", "start_s", "end_s"],
             },
@@ -291,7 +333,7 @@ TRANSFLOW_ANALYSIS_SCHEMA = {
             }
         },
     },
-    "required": ["duration_s", "cues"],
+    "required": ["duration_s", "chinese_subtitle_band", "cues", "special_points", "scenes"],
 }
 
 # Alias for backwards compatibility
@@ -371,21 +413,72 @@ def probe_video_duration(path: Path) -> float:
     return 0.0
 
 
-def fast_compress_video(src: Path, dst: Path, max_width: int = 960, fps: int = 15) -> bool:
-    """快速压缩视频用于多模态视觉理解：960宽、15fps、CRF=30、音频64k"""
+def fast_compress_video(
+    src: Path,
+    dst: Path,
+    max_width: int = 960,
+    fps: int = 15,
+    duration: float | None = None,
+) -> bool:
+    """快速压缩视频用于多模态视觉理解：960宽、15fps、音频64k。
+    
+    优先采用 NVIDIA GPU NVENC 硬件加速 (h264_nvenc)，
+    若失败或环境不支持则平滑降级至 CPU libx264。
+    超时时间根据视频时长自适应计算：max(300, int(duration * 0.5))。
+    """
+    if duration is None:
+        duration = probe_video_duration(src)
+    size_mb = src.stat().st_size / (1024 * 1024) if src.exists() else 0.0
+    # 动态超时拟合公式：实测 NVENC 速率为 0.075 * duration，赋予 2 倍安全裕度与 IO 缓冲，彻底收敛超时上限
+    timeout = max(45, int(2 * (0.08 * (duration or 0.0) + 0.1 * size_mb)))
+
+    # 1. 优先尝试 GPU NVENC 硬件加速
     try:
-        cmd = [
+        nvenc_cmd = [
             "ffmpeg", "-y", "-i", str(src),
             "-vf", f"scale='min({max_width},iw)':-2",
             "-r", str(fps),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+            "-c:v", "h264_nvenc", "-preset", "p1", "-cq", "32",
             "-c:a", "aac", "-b:a", "64k",
             str(dst)
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        return res.returncode == 0 and dst.exists() and dst.stat().st_size > 0
+        res = subprocess.run(nvenc_cmd, capture_output=True, text=True, timeout=timeout)
+        if res.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            logger.info(f"[FAST_COMPRESS] NVENC GPU 硬件加速压缩成功 (timeout={timeout}s)")
+            return True
+        logger.warning(
+            f"[FAST_COMPRESS] NVENC 退出码异常 ({res.returncode})，尝试降级至 CPU libx264: "
+            f"{res.stderr[:200] if res.stderr else ''}"
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(f"[FAST_COMPRESS] NVENC 硬件编码超时 ({timeout}s)")
+        if dst.exists():
+            dst.unlink(missing_ok=True)
+        return False
     except Exception as e:
-        logger.warning(f"Video compression failed: {e}")
+        logger.warning(f"[FAST_COMPRESS] NVENC 不可用 ({e})，降级至 CPU libx264")
+
+    # 2. 降级至 CPU libx264
+    try:
+        cpu_cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-vf", f"scale='min({max_width},iw)':-2",
+            "-r", str(fps),
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+            "-threads", "0",
+            "-c:a", "aac", "-b:a", "64k",
+            str(dst)
+        ]
+        res = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=timeout)
+        if res.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            logger.info(f"[FAST_COMPRESS] CPU libx264 降级压缩成功 (timeout={timeout}s)")
+            return True
+        logger.warning(f"[FAST_COMPRESS] CPU 压缩失败: {res.stderr[:200] if res.stderr else ''}")
+        return False
+    except Exception as e:
+        logger.warning(f"[FAST_COMPRESS] CPU 压缩异常: {e}")
+        if dst.exists():
+            dst.unlink(missing_ok=True)
         return False
 
 
@@ -440,6 +533,26 @@ class VideoAnalysisService:
     ) -> dict:
         if analysis_type not in ANALYSIS_TYPES:
             raise VideoAnalysisError(f"analysis_type must be one of: {', '.join(sorted(ANALYSIS_TYPES))}")
+
+        # 模型选型策略：
+        # 1. 用户显式指定模型时 (如 CLI 传入 gemini-3.8-flash) 予以绝对尊重
+        # 2. 未指定或默认时，日常任务首选 500 RPD 高吞吐模型 (gemini-3.5-flash-lite)，极大节约 20 RPD 配额
+        # 3. 视频时长 >= 10分钟 (600秒) 的长视频多模态任务，自动升档至 20 RPD 智力旗舰 (gemini-3.8-flash)
+        if not model or model == "gemini-3.5-flash-lite":
+            duration = None
+            if source_metadata and isinstance(source_metadata, dict):
+                dur_raw = source_metadata.get("duration") or source_metadata.get("duration_s")
+                if dur_raw is not None:
+                    try:
+                        duration = float(dur_raw)
+                    except (ValueError, TypeError):
+                        pass
+            if duration is not None and duration >= 600.0:
+                model = "gemini-3.8-flash"
+                logger.info("[MODEL_DISPATCH] 视频时长 %.1fs >= 10min，长视频多模态分析自动升档至 20 RPD 智力旗舰: %s", duration, model)
+            else:
+                model = "gemini-3.5-flash-lite"
+
         source_info = self._validate_source(source)
         job = VideoJob(
             id=f"video_{uuid.uuid4().hex[:16]}",
@@ -583,7 +696,7 @@ class VideoAnalysisService:
                     self._update(job, "compressing", 0.10)
                     temp_dir = Path(tempfile.gettempdir())
                     c_path = temp_dir / f"compressed_{uuid.uuid4().hex[:8]}_{source_path.name}"
-                    if await asyncio.to_thread(fast_compress_video, source_path, c_path):
+                    if await asyncio.to_thread(fast_compress_video, source_path, c_path, 960, 15, duration):
                         c_size = c_path.stat().st_size
                         logger.info(
                             "[AUTO_COMPRESS] 预压缩完成: %.1fMB -> %.1fMB (压缩率 %.1f%%)",
@@ -629,51 +742,40 @@ class VideoAnalysisService:
                         mime_type = file_info.get("mimeType", mime_type)
                     else:
                         job.file_uri = job.source
-                    # Model Fallback Tier: 当遇到 503 / High Demand 时，自动降级
-                    # 策略：优先保持 500 RPD 的 lite 系列 → 同代 20 RPD 标准版 / 备选版
+                    # Model Fallback Tier 完整官方技术代际:
+                    # 20 RPD 智力梯队: gemini-3.8-flash > 3.7-flash > 3.6-flash > 3.5-flash > 2.5-flash
+                    # 500 RPD 轻量梯队: gemini-3.5-flash-lite > 3.1-flash-lite > 2.5-flash-lite
                     fallback_models = [job.model]
-                    if job.model == "gemini-3.5-flash-lite":
-                        fallback_models.extend([
-                            "gemini-3.1-flash-lite",   # ✅ 同是 500 RPD 的 lite 版本
-                            "gemini-2.5-flash-lite",   # ✅ 保持 lite（降到 20 RPD）
-                            "gemini-2.5-flash",        # ✅ 稳定多模态标准版
-                            "gemini-3.5-flash",        # ✅ 多模态标准版
-                            "gemini-3.8-flash",        # ✅ 旗舰版
-                        ])
-                    elif job.model == "gemini-3.1-flash-lite":
-                        fallback_models.extend([
-                            "gemini-3.5-flash-lite",   # 互相备份 (500 RPD)
-                            "gemini-2.5-flash-lite",
-                            "gemini-2.5-flash",
-                            "gemini-3.5-flash",
-                            "gemini-3.8-flash",
-                        ])
-                    elif job.model == "gemini-2.5-flash":
-                        fallback_models.extend([
-                            "gemini-3.5-flash-lite",   # 高配额 lite
-                            "gemini-3.1-flash-lite",
-                            "gemini-2.5-flash-lite",
-                            "gemini-3.5-flash",
-                            "gemini-3.8-flash",
-                        ])
-                    elif job.model == "gemini-3.8-flash":
-                        fallback_models.extend([
-                            "gemini-3.5-flash-lite",
-                            "gemini-3.1-flash-lite",
-                            "gemini-2.5-flash",
-                            "gemini-3.5-flash",
-                            "gemini-2.5-flash-lite",
-                        ])
+                    if job.model in ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"):
+                        # 20 RPD 深度梯队：优先同代际降级，随后再回退至 500 RPD 轻量系列
+                        flash_chain = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
+                        lite_chain = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"]
+                        fallback_models.extend([m for m in flash_chain if m != job.model])
+                        fallback_models.extend(lite_chain)
+                    elif job.model in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"):
+                        # 500 RPD 轻量梯队：优先同代轻量互备，随后向上提档至 20 RPD 旗舰
+                        lite_chain = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"]
+                        flash_chain = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
+                        fallback_models.extend([m for m in lite_chain if m != job.model])
+                        fallback_models.extend(flash_chain)
                     else:
                         fallback_models.extend([
+                            "gemini-3.8-flash",
+                            "gemini-3.7-flash",
+                            "gemini-3.6-flash",
+                            "gemini-3.5-flash",
+                            "gemini-2.5-flash",
                             "gemini-3.5-flash-lite",
                             "gemini-3.1-flash-lite",
-                            "gemini-2.5-flash",
+                            "gemini-2.5-flash-lite",
                         ])
 
                     # 保留原序去重
                     seen_models = set()
-                    fallback_models = [m for m in fallback_models if not (m in seen_models or seen_models.add(m))]
+                    fallback_models = [
+                        m for m in fallback_models
+                        if not (m in seen_models or seen_models.add(m))
+                    ]
 
                     analyze_error = None
                     for m_idx, m_name in enumerate(fallback_models):
@@ -684,16 +786,23 @@ class VideoAnalysisService:
                             analyze_error = None
                             break
                         except VideoAnalysisError as v_err:
-                            is_high_demand = (
-                                v_err.status_code == 503
-                                or "high demand" in str(v_err).lower()
-                                or "temporarily unavailable" in str(v_err).lower()
+                            err_str = str(v_err).lower()
+                            should_failover = (
+                                v_err.status_code in {429, 503}
+                                or "high demand" in err_str
+                                or "temporarily unavailable" in err_str
+                                or "resource_exhausted" in err_str
+                                or "quota" in err_str
+                                or "rate limit" in err_str
+                                or "attractor" in err_str
+                                or "runaway" in err_str
                             )
-                            if is_high_demand and m_idx < len(fallback_models) - 1:
+                            if should_failover and m_idx < len(fallback_models) - 1:
                                 next_m = fallback_models[m_idx + 1]
                                 logger.warning(
-                                    "[MODEL_FAILOVER] 模型 %s 遇到官方服务拥挤 (503 High Demand)，自动切换至备选模型 %s...",
+                                    "[MODEL_FAILOVER] 模型 %s 遭遇异常 (%s)，自动降级切换至备选模型 %s...",
                                     m_name,
+                                    v_err,
                                     next_m,
                                 )
                                 await asyncio.sleep(1.5)
@@ -1013,7 +1122,7 @@ class VideoAnalysisService:
             "generationConfig": {
                 "responseMimeType": "application/json",
                 "responseSchema": schema,
-                "temperature": 0.2,
+                "temperature": 0.7,
                 "maxOutputTokens": 65536,  # 允许长视频输出大量字幕和分镜
             },
         }
@@ -1026,6 +1135,9 @@ class VideoAnalysisService:
         stream_log_file = self.job_dir / f"{job.id}_stream.log"
         chunks = []
         chunks_count = 0
+        recent_window = ""
+        last_chunk_text = ""
+        repeat_chunk_count = 0
         
         try:
             async with self.client.stream("POST", url, headers=headers, json=payload, timeout=600.0) as response:
@@ -1052,6 +1164,37 @@ class VideoAnalysisService:
                             for part in parts:
                                 if "text" in part:
                                     text_chunk = part["text"]
+
+                                    # Stream Runaway Anomaly Watchdog:
+                                    # 1. 连续 0 坍缩吸引子检测 (跨 chunk 滑动窗口检测)
+                                    recent_window = (recent_window + text_chunk)[-300:]
+                                    if re.search(r'0{30,}', recent_window):
+                                        logger.error(
+                                            f"[STREAM_WATCHDOG] 捕获到连续 30+ 个 '0' 异常坍缩吸引子 "
+                                            f"(job {job.id}, model {job.model})，主动切断连接触发故障转移"
+                                        )
+                                        raise VideoAnalysisError(
+                                            f"Gemini streaming token attractor loop detected (runaway zeros) in {job.model}",
+                                            status_code=429,
+                                        )
+
+                                    # 2. 相同 chunk 重复死循环检测
+                                    stripped_chunk = text_chunk.strip()
+                                    if stripped_chunk and stripped_chunk == last_chunk_text and len(stripped_chunk) > 3:
+                                        repeat_chunk_count += 1
+                                        if repeat_chunk_count >= 8:
+                                            logger.error(
+                                                f"[STREAM_WATCHDOG] 捕获到重复 chunk 连续出现 8 次 "
+                                                f"(job {job.id}, model {job.model})，主动切断连接触发故障转移"
+                                            )
+                                            raise VideoAnalysisError(
+                                                f"Gemini streaming repeating chunk attractor loop detected in {job.model}",
+                                                status_code=429,
+                                            )
+                                    else:
+                                        last_chunk_text = stripped_chunk
+                                        repeat_chunk_count = 0
+
                                     chunks.append(text_chunk)
                                     chunks_count += 1
                                     
