@@ -50,11 +50,19 @@ def format_table(headers: list[str], rows: list[list[str]]) -> str:
 
 
 def cmd_quota(args):
+    level = getattr(args, "level", 1)
+    if level == 2:
+        print("\n" + "=" * 68)
+        print(" [*] Activating Level 2: Live Browser Inspection via Playwright")
+        print("=" * 68)
+        cmd_snapshot(args)
+        return
+
     km = KeyManager()
     status = km.get_quota_status()
 
     print("\n" + "=" * 68)
-    print(" [*] StudioKey Quota Status (Gemini Pacific Time PT)")
+    print(" [*] StudioKey Quota Status - Level 1 Memory/JSON Counter (Gemini PT)")
     print("=" * 68)
     print(f"  Pacific Date:     {status['current_pacific_date']}")
     print(f"  Next Reset In:    {status['next_reset_in_hours']} hours ({status['seconds_to_next_reset']}s)")
@@ -253,7 +261,13 @@ def main():
     p_download.add_argument("--cookies-from-browser", default="", help="Load cookies from browser (e.g., chrome, edge)")
     p_download.set_defaults(func=cmd_download)
 
-    p_quota = subparsers.add_parser("quota", help="Display current quota and reset countdown")
+    p_quota = subparsers.add_parser("quota", help="Display quota status (Level 1: Fast in-memory counter, Level 2: Live Playwright browser audit)")
+    p_quota.add_argument("--level", "-l", type=int, choices=[1, 2], default=1, help="Inspection level: 1=Memory/JSON counter (<50ms, default), 2=Live Playwright browser snapshot & DOM audit (~8s)")
+    p_quota.add_argument("--headless", action="store_true", help="For Level 2: run headless without opening visible Chrome window")
+    p_quota.add_argument("--profile", default="0", help="For Level 2: Chrome profile index (0, 1), default: 0")
+    p_quota.add_argument("--url", help="For Level 2: AI Studio rate limit URL")
+    p_quota.add_argument("--wait", type=int, default=8, help="For Level 2: Wait seconds for charts to render")
+    p_quota.add_argument("--output", "-o", help="For Level 2: Custom output image file path")
     p_quota.set_defaults(func=cmd_quota)
 
     p_history = subparsers.add_parser("history", help="Display 30-day quota history")

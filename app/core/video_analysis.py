@@ -743,19 +743,19 @@ class VideoAnalysisService:
                     else:
                         job.file_uri = job.source
                     # Model Fallback Tier 完整官方技术代际:
-                    # 20 RPD 智力梯队: gemini-3.8-flash > 3.7-flash > 3.6-flash > 3.5-flash > 2.5-flash
-                    # 500 RPD 轻量梯队: gemini-3.5-flash-lite > 3.1-flash-lite > 2.5-flash-lite
+                    # 20 RPD 智力梯队: gemini-3.8-flash > 3.7-flash > 3.6-flash > 3.5-flash
+                    # 500 RPD 轻量梯队: gemini-3.5-flash-lite > 3.1-flash-lite
                     fallback_models = [job.model]
-                    if job.model in ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"):
+                    if job.model in ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"):
                         # 20 RPD 深度梯队：优先同代际降级，随后再回退至 500 RPD 轻量系列
-                        flash_chain = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
-                        lite_chain = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"]
+                        flash_chain = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
+                        lite_chain = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
                         fallback_models.extend([m for m in flash_chain if m != job.model])
                         fallback_models.extend(lite_chain)
-                    elif job.model in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"):
+                    elif job.model in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite"):
                         # 500 RPD 轻量梯队：优先同代轻量互备，随后向上提档至 20 RPD 旗舰
-                        lite_chain = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"]
-                        flash_chain = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
+                        lite_chain = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+                        flash_chain = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
                         fallback_models.extend([m for m in lite_chain if m != job.model])
                         fallback_models.extend(flash_chain)
                     else:
@@ -764,10 +764,8 @@ class VideoAnalysisService:
                             "gemini-3.7-flash",
                             "gemini-3.6-flash",
                             "gemini-3.5-flash",
-                            "gemini-2.5-flash",
                             "gemini-3.5-flash-lite",
                             "gemini-3.1-flash-lite",
-                            "gemini-2.5-flash-lite",
                         ])
 
                     # 保留原序去重

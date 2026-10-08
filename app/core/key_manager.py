@@ -16,12 +16,10 @@ DEFAULT_MODEL_RPD = {
     "gemini-3.7-flash": 20,
     "gemini-3.6-flash": 20,
     "gemini-3.5-flash": 20,
-    "gemini-2.5-flash": 20,
     "gemini-3-flash": 20,
     "gemini-3-flash-preview": 20,
     "gemini-3.5-flash-lite": 500,
     "gemini-3.1-flash-lite": 500,
-    "gemini-2.5-flash-lite": 20,
     "gemini-flash-latest": 20,
     "gemini-flash-lite-latest": 500,
 }
@@ -302,9 +300,15 @@ class KeyManager:
             if rate_limited:
                 key_info["rate_limit_count"] += 1
             if cooldown_seconds > 0:
-                key_info["cooldown_until"] = max(
-                    key_info["cooldown_until"], now + cooldown_seconds
-                )
+                if model:
+                    m_quota = self._get_model_quota(key_info, model)
+                    m_quota["cooldown_until"] = max(
+                        m_quota["cooldown_until"], now + cooldown_seconds
+                    )
+                else:
+                    key_info["cooldown_until"] = max(
+                        key_info["cooldown_until"], now + cooldown_seconds
+                    )
             self._persist_state()
 
     def release(self, key_str: str):

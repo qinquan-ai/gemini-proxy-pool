@@ -36,7 +36,7 @@ python main.py
 GEMINI_KEYS="账号1|AIzaSy...,账号2|AIzaSy...,账号3|AIzaSy...,账号4|AIzaSy..."
 # 推荐高频/批量默认模型（每日 500 次配额天花板）：
 GEMINI_DEFAULT_MODEL="gemini-3.5-flash-lite"
-GEMINI_MODELS="gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.8-flash,gemini-3.5-flash,gemini-2.5-flash"
+GEMINI_MODELS="gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash"
 ```
 
 只有当四把 Key 属于四个独立 Cloud Project 时，才可能对应四套项目配额。请遵守 Google 的服务条款和项目配额规则。
@@ -48,7 +48,7 @@ Google AI Studio 免费层对不同模型配额差异巨大，选错模型极易
 1. **第一梯队·额度天花板（强烈推荐作为默认模型）**：
    - **`gemini-3.5-flash-lite`** / **`gemini-3.1-flash-lite`**：**500 RPD (每日 500 次)**，15 RPM，支持多模态与音频，高频对话与批量任务首选。
 2. **第二梯队·旗舰大模型（长文本与复杂多模态）**：
-   - **`gemini-3.8-flash`** / **`gemini-3.5-flash`** / **`gemini-2.5-flash`**：**20 RPD (每日仅 20 次)**，5 RPM，额度较为紧俏，建议留给深度视频分析或关键复杂推理。
+   - **`gemini-3.8-flash`** / **`gemini-3.7-flash`** / **`gemini-3.6-flash`** / **`gemini-3.5-flash`**：**20 RPD (每日仅 20 次)**，5 RPM，额度较为紧俏，建议留给深度视频分析或关键复杂推理。（注：`gemini-2.5-flash` 官方已下线不可用）
 3. **第三梯队·超大并发纯文本**：
    - **`gemma-4-31b-it`** / **`gemma-4-26b-a4b-it`**：**14,400 RPD (每日 1.44 万次)**，30 RPM，轻量文本任务无限畅享。
 

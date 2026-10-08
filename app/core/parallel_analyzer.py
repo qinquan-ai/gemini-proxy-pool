@@ -47,10 +47,8 @@ class ParallelVideoAnalyzer:
             "gemini-3.7-flash",
             "gemini-3.6-flash",
             "gemini-3.5-flash",
-            "gemini-2.5-flash",
             "gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite",
-            "gemini-2.5-flash-lite",
             "gemini-flash-latest",
         ]
 
@@ -86,7 +84,7 @@ class ParallelVideoAnalyzer:
             key_name = key_info["name"]
 
             # Select best available model with remaining quota on this key
-            selected_model = "gemini-2.5-flash"
+            selected_model = "gemini-3.5-flash"
             for m in self.preferred_models:
                 m_q = self.key_manager._get_model_quota(key_info, m)
                 now = time.time()
