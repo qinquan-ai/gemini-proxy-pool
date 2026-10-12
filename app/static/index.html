@@ -5,11 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <title>StudioKey Gateway</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231d1d1f'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='Arial' font-size='18' font-weight='700' fill='white'%3ES%3C/text%3E%3C/svg%3E" />
-    <link rel="stylesheet" href="/assets/styles/tokens.css?v=0.7.2" />
-    <link rel="stylesheet" href="/assets/styles/base.css?v=0.7.2" />
-    <link rel="stylesheet" href="/assets/styles/dashboard.css?v=0.7.2" />
-    <script type="module" src="/assets/dashboard.js?v=0.7.2"></script>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2318181b'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='Arial' font-size='18' font-weight='700' fill='white'%3ES%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/assets/ui/tokens/glass.css?v=0.8.0" />
+    <link rel="stylesheet" href="/assets/styles/tokens.css?v=0.8.0" />
+    <link rel="stylesheet" href="/assets/styles/base.css?v=0.8.0" />
+    <link rel="stylesheet" href="/assets/styles/dashboard.css?v=0.8.0" />
+    <script type="module" src="/assets/dashboard.js?v=0.8.0"></script>
   </head>
   <body>
     <header class="app-header">
@@ -18,10 +19,14 @@
           <span class="brand-mark" aria-hidden="true">S</span>
           <span>
             <strong>StudioKey Gateway</strong>
-            <small>Gemini 号池与视频分析</small>
+            <small>Gemini 号池网关与配额监控</small>
           </span>
         </div>
         <div class="header-actions">
+          <button id="verify-modal-btn" class="gbtn" type="button" title="打开批量测活面板" style="padding: 0.35rem 0.75rem; font-size: 0.78rem;">
+            <span>🛡️</span>
+            <span>批量测活</span>
+          </button>
           <div class="connection" role="status" aria-live="polite">
             <span id="health-dot" class="health-dot"></span>
             <span id="health-text">正在连接</span>
@@ -33,62 +38,71 @@
     </header>
 
     <main>
-      <section class="overview" aria-labelledby="overview-title">
+      <!-- 1. 号池卡片区 -->
+      <section class="pool-section" aria-labelledby="pool-title" style="margin-top: 0.2rem;">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">运行概览</p>
-            <h1 id="overview-title">网关状态</h1>
+            <h1 id="pool-title" style="margin-top: 0;">账号与模型配额</h1>
+            <p id="model-info" class="supporting-text">正在读取账号与模型配额</p>
           </div>
-          <label class="switch-control">
-            <input id="auto-refresh" type="checkbox" checked />
-            <span class="switch-track" aria-hidden="true"><span></span></span>
-            <span>自动刷新</span>
-          </label>
+          <div class="header-actions">
+            <label class="switch-control">
+              <input id="auto-refresh" type="checkbox" checked />
+              <span class="switch-track" aria-hidden="true"><span></span></span>
+              <span>自动刷新</span>
+            </label>
+            <span id="updated-at" class="updated-at">尚未更新</span>
+          </div>
         </div>
-        <div id="summary" class="summary" aria-label="网关统计"></div>
+        <div id="cards-container" class="key-cards-grid" aria-label="Key 账号卡片列表">
+          <div class="table-message" style="grid-column: 1 / -1;">正在载入 Key 卡片状态...</div>
+        </div>
       </section>
 
-      <section class="pool-section" aria-labelledby="pool-title">
+      <!-- 2. Prompt 聊天调试面板 (可手动选择单 Key 或自动轮询) -->
+      <section class="pool-section" aria-labelledby="chat-title">
+        <prompt-chat id="prompt-chat-panel"></prompt-chat>
+      </section>
+
+      <!-- 3. 请求审计流水表 -->
+      <section class="pool-section" aria-labelledby="traces-title">
         <div class="section-heading compact">
           <div>
-            <h2 id="pool-title">Key 池</h2>
-            <p id="model-info" class="supporting-text">正在读取模型配置</p>
+            <h2 id="traces-title">请求审计流水</h2>
+            <p id="traces-summary" class="supporting-text">实时记录最近 60 笔调用审计追踪</p>
           </div>
-          <span id="updated-at" class="updated-at">尚未更新</span>
+          <div id="trace-badges" class="source-badges" aria-label="请求协议统计"></div>
         </div>
         <div class="table-surface">
-          <div class="table-scroll" tabindex="0" aria-label="Key 状态表，可横向滚动">
+          <div class="table-scroll" tabindex="0" aria-label="最近请求审计表，可横向滚动">
             <table class="key-table">
-              <thead><tr><th>名称</th><th>状态</th><th>Key</th><th class="numeric">请求</th><th class="numeric">成功</th><th class="numeric">Token</th><th class="numeric">失败</th><th class="numeric">429</th><th class="numeric">在途</th><th class="numeric">冷却</th><th>最近错误</th></tr></thead>
-              <tbody id="pool-body"><tr><td class="table-message" colspan="11">正在载入状态</td></tr></tbody>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>协议</th>
+                  <th>模型 / 端点</th>
+                  <th>命中 Key</th>
+                  <th>状态码</th>
+                  <th class="numeric">耗时</th>
+                  <th class="numeric">Tokens</th>
+                  <th>模式</th>
+                  <th>错误与追踪</th>
+                </tr>
+              </thead>
+              <tbody id="traces-body">
+                <tr><td class="table-message" colspan="9">正在载入流水</td></tr>
+              </tbody>
             </table>
           </div>
         </div>
       </section>
 
-      <section class="pool-section" aria-labelledby="jobs-title">
-        <div class="section-heading compact">
-          <div>
-            <h2 id="jobs-title">视频分析任务</h2>
-            <p id="video-job-summary" class="supporting-text">正在读取任务队列</p>
-          </div>
-          <div id="source-badges" class="source-badges" aria-label="支持的视频来源"></div>
-        </div>
-        <div class="table-surface">
-          <div class="table-scroll" tabindex="0" aria-label="最近视频任务表，可横向滚动">
-            <table class="jobs-table">
-              <thead><tr><th>任务</th><th>来源</th><th>分析类型</th><th>状态</th><th>进度</th><th>模型 / Key</th><th>耗时</th><th>最近错误</th></tr></thead>
-              <tbody id="jobs-body"><tr><td class="table-message" colspan="8">正在载入任务</td></tr></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
+      <!-- 4. 接入配置与快捷测试 -->
       <section class="pool-section integration-section" aria-labelledby="integration-title">
         <div class="section-heading compact">
           <div>
             <h2 id="integration-title">接入配置</h2>
-            <p class="supporting-text">OpenAI 兼容接口、Gemini 原生接口与视频 MCP</p>
+            <p class="supporting-text">OpenAI 兼容接口与 Google 原生协议通道</p>
           </div>
         </div>
         <div class="integration-grid">
@@ -97,7 +111,7 @@
             <dl class="config-list">
               <div><dt>OpenAI Base URL</dt><dd><code id="api-base-url">http://localhost:8000/v1</code><button class="copy-button" type="button" data-copy-target="api-base-url" title="复制 OpenAI 地址" aria-label="复制 OpenAI 地址">&#10697;</button></dd></div>
               <div><dt>Gemini Base URL</dt><dd><code id="gemini-base-url">http://localhost:8000</code><button class="copy-button" type="button" data-copy-target="gemini-base-url" title="复制 Gemini 地址" aria-label="复制 Gemini 地址">&#10697;</button></dd></div>
-              <div><dt>视频 MCP</dt><dd><code id="mcp-url">http://localhost:8000/mcp/</code><button class="copy-button" type="button" data-copy-target="mcp-url" title="复制 MCP 地址" aria-label="复制 MCP 地址">&#10697;</button></dd></div>
+              <div><dt>审计流水接口</dt><dd><code id="traces-url">http://localhost:8000/v1/traces</code><button class="copy-button" type="button" data-copy-target="traces-url" title="复制审计接口地址" aria-label="复制审计接口地址">&#10697;</button></dd></div>
             </dl>
           </article>
           <article class="guide-panel">
@@ -119,7 +133,12 @@
       </section>
     </main>
 
+    <key-drawer id="key-detail-drawer"></key-drawer>
+    <verification-modal id="verification-modal"></verification-modal>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <footer class="app-footer"><span>状态接口 <code>/v1/status</code></span><span>Key 仅显示脱敏前缀</span></footer>
+    <footer class="app-footer">
+      <span>状态接口 <code>/v1/status</code></span>
+      <span>Key 仅显示脱敏前缀 · 点击卡片或右下角详情可查看专属流水与运维操作</span>
+    </footer>
   </body>
 </html>

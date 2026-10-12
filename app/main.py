@@ -7,7 +7,10 @@ import re
 import time
 import uuid
 import traceback
-from contextlib import AsyncExitStack, asynccontextmanager
+from collections import deque
+from contextlib import asynccontextmanager
+from datetime import datetime
+from urllib.parse import unquote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -17,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from app.core.key_manager import KeyManager
+from app.core.key_manager import KeyManager, CANONICAL_MODELS
 from app.core.responses_adapter import (
     chat_completion_to_response,
     response_envelope,
@@ -26,8 +29,6 @@ from app.core.responses_adapter import (
 )
 from app.core.thought_signatures import thought_signature_store
 from app.core.translator import openai_to_gemini, translate_tools
-from app.core.video_analysis import VideoAnalysisService
-from app.mcp_server import configure_video_service, mcp
 
 load_dotenv()
 
@@ -38,7 +39,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-DEFAULT_MODEL = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-3-flash-preview")
+DEFAULT_MODEL = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-3.5-flash-lite")
 AVAILABLE_MODELS = [
     model.strip()
     for model in os.getenv("GEMINI_MODELS", DEFAULT_MODEL).split(",")
@@ -54,6 +55,53 @@ MODEL_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 NATIVE_GEMINI_PATH_PATTERN = re.compile(
     r"^models(?:/[A-Za-z0-9._-]+(?::(?:generateContent|streamGenerateContent|countTokens))?)?$"
 )
+
+# 请求调用审计流水缓冲 (保留最近 60 笔调用轨迹供 Web 控制台实时审计)
+MAX_TRACES = 60
+REQUEST_TRACES: deque[dict] = deque(maxlen=MAX_TRACES)
+
+
+def record_trace(
+    protocol: str,
+    method: str,
+    endpoint: str,
+    model: str,
+    key_name: str,
+    status_code: int,
+    latency_ms: float,
+    tokens: dict | None = None,
+    fail_fast: bool = False,
+    route_mode: str = "",
+    error: str = "",
+):
+    tok = tokens or {}
+    total_tok = int(
+        tok.get("totalTokenCount")
+        or tok.get("total_tokens")
+        or (int(tok.get("promptTokenCount") or 0) + int(tok.get("candidatesTokenCount") or 0))
+    )
+    effective_mode = route_mode or ("Fail-Fast" if fail_fast else "01")
+    trace_entry = {
+        "id": f"tr_{uuid.uuid4().hex[:8]}",
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "protocol": protocol,
+        "method": method,
+        "endpoint": endpoint,
+        "model": model,
+        "key_name": key_name or "N/A",
+        "status_code": status_code,
+        "latency_ms": round(latency_ms, 1),
+        "input_tokens": int(tok.get("promptTokenCount") or 0),
+        "output_tokens": int(tok.get("candidatesTokenCount") or 0),
+        "thought_tokens": int(tok.get("thoughtsTokenCount") or 0),
+        "total_tokens": total_tok,
+        "route_mode": effective_mode,
+        "fail_fast": bool(fail_fast),
+        "error": error[:160] if error else "",
+    }
+    REQUEST_TRACES.appendleft(trace_entry)
+
 
 def _sanitize_no_proxy():
     """Sanitize NO_PROXY environment variables to strip out IPv6 entries like ::1 that crash httpx's URLPattern parser."""
@@ -76,28 +124,33 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS),
         limits=httpx.Limits(max_connections=40, max_keepalive_connections=20),
     )
-    # Print clean local access instructions on startup
     print()
     logger.info("=" * 60)
-    logger.info("🚀 GEMINI PROXY POOL ACTIVE")
-    logger.info("👉 Local Dashboard: http://localhost:8000")
-    logger.info("👉 Health Status:   http://localhost:8000/v1/status")
-    logger.info("👉 Video MCP:      http://localhost:8000/mcp/")
+    logger.info("🚀 GEMINI PROXY GATEWAY ACTIVE (High-Throughput Pool)")
+    logger.info("👉 Web Dashboard:    http://localhost:8000")
+    logger.info("👉 Native Gemini:    http://localhost:8000/v1beta")
+    logger.info("👉 OpenAI Compat:    http://localhost:8000/v1")
+    logger.info("👉 Health Status:    http://localhost:8000/v1/status")
     logger.info("=" * 60)
     print()
-    app.state.video_service = VideoAnalysisService(key_pool, app.state.http_client)
-    configure_video_service(app.state.video_service)
-    async with AsyncExitStack() as stack:
-        await stack.enter_async_context(mcp.session_manager.run())
-        yield
-    await app.state.video_service.shutdown()
+    yield
     await app.state.http_client.aclose()
 
 
-app = FastAPI(title="Gemini Proxy Pool", version="0.7.2", lifespan=lifespan)
+app = FastAPI(title="Gemini Proxy Pool", version="0.8.0", lifespan=lifespan)
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
-app.mount("/mcp", mcp.streamable_http_app())
+
+
+def get_http_client(request: Request) -> httpx.AsyncClient:
+    client = getattr(request.app.state, "http_client", None)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS),
+            limits=httpx.Limits(max_connections=40, max_keepalive_connections=20),
+        )
+        request.app.state.http_client = client
+    return client
 
 allowed_origins = [
     origin.strip()
@@ -127,6 +180,116 @@ def require_proxy_auth(request: Request):
         token, PROXY_API_TOKEN
     ):
         raise HTTPException(status_code=401, detail="Invalid proxy token")
+
+
+def extract_target_key(request: Request) -> str | None:
+    raw = request.headers.get("x-target-key") or request.query_params.get("target_key")
+    if not raw:
+        return None
+    try:
+        return unquote(raw).strip()
+    except Exception:
+        return raw.strip()
+
+
+MODE_11_TIMEOUT_SECONDS = float(os.getenv("MODE_11_TIMEOUT_SECONDS", "300"))
+HEDGE_TIMEOUT_SECONDS = float(os.getenv("HEDGE_TIMEOUT_SECONDS", "120"))
+HEDGE_INTERVAL_SECONDS = float(os.getenv("HEDGE_INTERVAL_SECONDS", "3.0"))
+MAX_HEDGED_CONCURRENCY = int(os.getenv("MAX_HEDGED_CONCURRENCY", "3"))
+
+
+def extract_route_mode(request: Request, body_dict: dict | None = None) -> str:
+    raw = request.headers.get("x-route-mode") or request.headers.get("x-routing-mode")
+    if raw in ("11", "10", "01", "00"):
+        return raw
+    raw = request.query_params.get("route_mode") or request.query_params.get("mode")
+    if raw in ("11", "10", "01", "00"):
+        return raw
+    if body_dict and isinstance(body_dict, dict):
+        raw = body_dict.get("route_mode") or body_dict.get("routing_mode")
+        if raw in ("11", "10", "01", "00"):
+            return str(raw)
+    target_key = extract_target_key(request)
+    if target_key:
+        return "11"
+    return "01"
+
+
+def extract_fallback_models(request: Request, body_dict: dict | None = None) -> list[str]:
+    raw = request.headers.get("x-fallback-models") or request.query_params.get("fallback_models")
+    if not raw and body_dict and isinstance(body_dict, dict):
+        raw = body_dict.get("fallback_models")
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(m).strip() for m in raw if str(m).strip()]
+    return [m.strip() for m in str(raw).split(",") if m.strip()]
+
+
+def build_route_candidates(
+    mode: str,
+    target_model: str,
+    target_key_name: str | None = None,
+    custom_fallbacks: list[str] | None = None,
+) -> list[tuple[dict, str]]:
+    candidates: list[tuple[dict, str]] = []
+    if mode == "11":
+        if target_key_name:
+            k = key_pool.find_key_by_name(target_key_name)
+            if k and not k.get("disabled"):
+                candidates.append((k, target_model))
+        else:
+            for k in key_pool.keys:
+                if not k.get("disabled") and key_pool.can_consume_bool(k, target_model, check_concurrency=False):
+                    candidates.append((k, target_model))
+                    break
+        return candidates
+
+    if mode == "10":
+        key_info = None
+        if target_key_name:
+            key_info = key_pool.find_key_by_name(target_key_name)
+        if not key_info:
+            for k in key_pool.keys:
+                if not k.get("disabled"):
+                    key_info = k
+                    break
+        if key_info and not key_info.get("disabled"):
+            ranked = key_pool.get_ranked_models(target_model, key_info, custom_fallbacks=custom_fallbacks)
+            for item in ranked:
+                candidates.append((key_info, item["model"]))
+        return candidates
+
+    if mode == "01":
+        available = [
+            k for k in key_pool.keys
+            if not k.get("disabled") and key_pool.can_consume_bool(k, target_model, check_concurrency=False)
+        ]
+        available.sort(key=lambda k: (
+            k.get("model_in_flight", {}).get(target_model, 0),
+            key_pool._get_model_quota(k, target_model).get("success_today", 0)
+        ))
+        for k in available:
+            candidates.append((k, target_model))
+        return candidates
+
+    if mode == "00":
+        all_models = key_pool.get_ranked_models(target_model, None, custom_fallbacks=custom_fallbacks)
+        for item in all_models:
+            m = item["model"]
+            keys_for_m = [
+                k for k in key_pool.keys
+                if not k.get("disabled") and key_pool.can_consume_bool(k, m, check_concurrency=False)
+            ]
+            keys_for_m.sort(key=lambda k: (
+                k.get("model_in_flight", {}).get(m, 0),
+                key_pool._get_model_quota(k, m).get("success_today", 0)
+            ))
+            for k in keys_for_m:
+                candidates.append((k, m))
+        return candidates
+
+    return candidates
 
 
 def normalize_model(requested_model: str | None) -> str:
@@ -255,7 +418,7 @@ def finalize_failed_response(
         return "retry"
 
     # Request/model errors are not evidence that the key is unhealthy.
-    key_pool.release(api_key)
+    key_pool.release(api_key, model=model)
     return "return"
 
 
@@ -353,122 +516,400 @@ async def native_gemini_gateway(google_path: str, request: Request):
     if not is_allowed_native_gemini_path(google_path):
         return native_google_error("Unsupported native Gemini endpoint", 404)
 
+    req_start_time = time.time()
     body = await request.body()
-    target = f"https://generativelanguage.googleapis.com/v1beta/{google_path}"
     is_stream = "streamGenerateContent" in google_path
+    client = get_http_client(request)
 
     extracted_model = None
     if "models/" in google_path:
         m_part = google_path.split("models/", 1)[1]
         extracted_model = m_part.split(":", 1)[0].split("/", 1)[0]
 
-    for attempt in range(max(1, len(key_pool.keys))):
-        key_info = key_pool.acquire_key(model=extracted_model)
+    model_display = extracted_model or DEFAULT_MODEL
+
+    fail_fast = (
+        request.headers.get("x-retry-policy", "").lower() == "fail-fast"
+        or request.headers.get("x-client-mode", "").lower() == "pipeline"
+        or request.query_params.get("fail_fast", "").lower() in ("1", "true")
+    )
+    target_key = extract_target_key(request)
+
+    if fail_fast:
+        key_info = key_pool.acquire_key(model=extracted_model, target_key_name=target_key)
         if not key_info:
-            break
+            return native_google_error("No healthy API key available", 503)
         api_key = key_info["key"]
+        key_name = key_info["name"]
         finalized = False
+        target = f"https://generativelanguage.googleapis.com/v1beta/{google_path}"
         try:
-            upstream_request = request.app.state.http_client.build_request(
+            upstream_req = client.build_request(
                 request.method,
                 target,
                 params=list(request.query_params.multi_items()),
                 headers=native_gemini_headers(request, api_key),
                 content=body,
             )
-            if is_stream:
-                upstream = await request.app.state.http_client.send(
-                    upstream_request, stream=True
+            upstream = await client.send(upstream_req, stream=is_stream)
+            if upstream.status_code >= 400:
+                err_b = await upstream.aread()
+                msg = google_error_message(upstream, err_b)
+                finalize_failed_response(api_key, upstream, msg, model=extracted_model)
+                finalized = True
+                await upstream.aclose()
+                return Response(
+                    content=err_b,
+                    status_code=upstream.status_code,
+                    media_type=upstream.headers.get("content-type"),
                 )
-                if upstream.status_code >= 400:
-                    error_body = await upstream.aread()
-                    message = google_error_message(upstream, error_body)
-                    action = finalize_failed_response(api_key, upstream, message, model=extracted_model)
-                    finalized = True
-                    await upstream.aclose()
-                    if action == "retry":
-                        continue
-                    return Response(
-                        content=error_body,
-                        status_code=upstream.status_code,
-                        media_type=upstream.headers.get("content-type"),
-                    )
 
-                async def stream_body():
-                    stream_finalized = False
+            if is_stream:
+                async def ff_stream():
                     usage_tail = b""
+                    ff_finalized = False
                     try:
                         async for chunk in upstream.aiter_raw():
                             usage_tail = (usage_tail + chunk)[-262_144:]
                             yield chunk
-                        key_pool.mark_success(
-                            api_key, usage_metadata_from_sse_tail(usage_tail), model=extracted_model
-                        )
-                        stream_finalized = True
-                    except (httpx.HTTPError, OSError) as exc:
-                        key_pool.mark_failure(
-                            api_key,
-                            reason=f"Native stream transport error: {exc}",
-                            cooldown_seconds=key_pool.transient_cooldown,
-                            model=extracted_model,
-                        )
-                        stream_finalized = True
-                        raise
+                        usg = usage_metadata_from_sse_tail(usage_tail)
+                        key_pool.mark_success(api_key, usg, model=extracted_model)
+                        ff_finalized = True
                     finally:
                         await upstream.aclose()
-                        if not stream_finalized:
-                            key_pool.release(api_key)
+                        if not ff_finalized:
+                            key_pool.release(api_key, model=extracted_model)
 
                 finalized = True
                 return StreamingResponse(
-                    stream_body(),
-                    status_code=upstream.status_code,
+                    ff_stream(),
+                    status_code=200,
                     media_type=upstream.headers.get("content-type"),
                 )
-
-            upstream = await request.app.state.http_client.send(upstream_request)
-            if upstream.status_code >= 400:
-                message = google_error_message(upstream)
-                action = finalize_failed_response(api_key, upstream, message, model=extracted_model)
+            else:
+                try:
+                    usg = usage_metadata_from_payload(upstream.json())
+                except Exception:
+                    usg = {}
+                key_pool.mark_success(api_key, usg, model=extracted_model)
                 finalized = True
-                if action == "retry":
-                    continue
                 return Response(
                     content=upstream.content,
-                    status_code=upstream.status_code,
+                    status_code=200,
                     media_type=upstream.headers.get("content-type"),
                 )
-            try:
-                usage = usage_metadata_from_payload(upstream.json())
-            except ValueError:
-                usage = {}
-            key_pool.mark_success(api_key, usage, model=extracted_model)
-            finalized = True
-            return Response(
-                content=upstream.content,
-                status_code=upstream.status_code,
-                media_type=upstream.headers.get("content-type"),
-            )
-        except (httpx.HTTPError, OSError) as exc:
-            if not finalized:
-                key_pool.mark_failure(
-                    api_key,
-                    reason=f"Native gateway transport error: {exc}",
-                    cooldown_seconds=key_pool.transient_cooldown,
-                    model=extracted_model,
-                )
-                finalized = True
-            logger.warning(
-                "Native Gemini attempt %d failed for %s: %s",
-                attempt + 1,
-                key_info["name"],
-                exc,
-            )
         finally:
             if not finalized:
-                key_pool.release(api_key)
+                key_pool.release(api_key, model=extracted_model)
 
-    return native_google_error("No healthy API key is available")
+    route_mode = extract_route_mode(request)
+    fallbacks = extract_fallback_models(request)
+    candidates = build_route_candidates(route_mode, model_display, target_key, fallbacks)
+    if not candidates:
+        return native_google_error(
+            "No available candidate key/model matching routing policy", 503
+        )
+
+    def _build_target_url(cand_m: str) -> str:
+        if extracted_model and extracted_model in google_path:
+            p = google_path.replace(f"models/{extracted_model}", f"models/{cand_m}")
+            return f"https://generativelanguage.googleapis.com/v1beta/{p}"
+        return f"https://generativelanguage.googleapis.com/v1beta/{google_path}"
+
+    if route_mode == "11":
+        key_info, cand_model = candidates[0]
+        api_key = key_info["key"]
+        key_name = key_info["name"]
+        attempt = 0
+        last_error_message = ""
+        last_status_code = 503
+
+        while time.time() - req_start_time < MODE_11_TIMEOUT_SECONDS:
+            if await request.is_disconnected():
+                return native_google_error("Client cancelled request", 499)
+
+            if not key_pool.can_consume_bool(key_info, cand_model, check_concurrency=False):
+                last_error_message = f"Daily quota exhausted for model {cand_model} on key {key_name}"
+                last_status_code = 429
+                break
+
+            acquired = key_pool.acquire_key(
+                model=cand_model,
+                target_key_name=key_name,
+                allow_transient_cooling=True,
+            )
+            if not acquired:
+                await asyncio.sleep(0.2)
+                continue
+
+            target_url = _build_target_url(cand_model)
+            finalized = False
+            try:
+                upstream_req = client.build_request(
+                    request.method,
+                    target_url,
+                    params=list(request.query_params.multi_items()),
+                    headers=native_gemini_headers(request, api_key),
+                    content=body,
+                )
+                upstream = await client.send(upstream_req, stream=is_stream)
+
+                if upstream.status_code == 200:
+                    if is_stream:
+                        async def m11_stream():
+                            usage_tail = b""
+                            st_finalized = False
+                            try:
+                                async for chunk in upstream.aiter_raw():
+                                    if await request.is_disconnected():
+                                        break
+                                    usage_tail = (usage_tail + chunk)[-262_144:]
+                                    yield chunk
+                                usg = usage_metadata_from_sse_tail(usage_tail)
+                                key_pool.mark_success(api_key, usg, model=cand_model)
+                                st_finalized = True
+                            finally:
+                                await upstream.aclose()
+                                if not st_finalized:
+                                    key_pool.release(api_key, model=cand_model)
+
+                        finalized = True
+                        return StreamingResponse(
+                            m11_stream(),
+                            status_code=200,
+                            media_type=upstream.headers.get("content-type"),
+                        )
+                    else:
+                        try:
+                            usg = usage_metadata_from_payload(upstream.json())
+                        except Exception:
+                            usg = {}
+                        key_pool.mark_success(api_key, usg, model=cand_model)
+                        finalized = True
+                        return Response(
+                            content=upstream.content,
+                            status_code=200,
+                            media_type=upstream.headers.get("content-type"),
+                        )
+
+                err_b = await upstream.aread()
+                await upstream.aclose()
+                msg = google_error_message(upstream, err_b)
+                last_error_message = msg
+                last_status_code = upstream.status_code
+                finalize_failed_response(api_key, upstream, msg, model=cand_model)
+                finalized = True
+
+                if upstream.status_code in (400, 401, 403, 404):
+                    return Response(
+                        content=err_b,
+                        status_code=upstream.status_code,
+                        media_type=upstream.headers.get("content-type"),
+                    )
+
+                backoff = min(1.0 * (2 ** min(attempt, 4)), 20.0)
+                attempt += 1
+                await asyncio.sleep(backoff)
+            except (httpx.HTTPError, OSError) as exc:
+                if not finalized:
+                    key_pool.mark_failure(
+                        api_key,
+                        reason=str(exc),
+                        cooldown_seconds=key_pool.transient_cooldown,
+                        model=cand_model,
+                    )
+                    finalized = True
+                last_error_message = f"Transport error: {exc}"
+                attempt += 1
+                await asyncio.sleep(1.0)
+            finally:
+                if not finalized:
+                    key_pool.release(api_key, model=cand_model)
+
+        return native_google_error(
+            last_error_message or "Mode 11 retry timeout exceeded",
+            status_code=last_status_code,
+        )
+
+    cand_idx = 0
+    in_flight_tasks: dict[asyncio.Task, tuple[dict, str]] = {}
+    last_error_msg = ""
+    last_status = 503
+
+    async def _execute_native_attempt(
+        k_info: dict, m_name: str
+    ) -> tuple[int, Response | StreamingResponse | None, str]:
+        a_key = k_info["key"]
+        finalized_inner = False
+        t_url = _build_target_url(m_name)
+        try:
+            req_up = client.build_request(
+                request.method,
+                t_url,
+                params=list(request.query_params.multi_items()),
+                headers=native_gemini_headers(request, a_key),
+                content=body,
+            )
+            up = await client.send(req_up, stream=is_stream)
+            if up.status_code == 200:
+                if is_stream:
+                    async def nat_stream():
+                        usage_tail = b""
+                        nat_finalized = False
+                        try:
+                            async for chunk in up.aiter_raw():
+                                if await request.is_disconnected():
+                                    break
+                                usage_tail = (usage_tail + chunk)[-262_144:]
+                                yield chunk
+                            usg = usage_metadata_from_sse_tail(usage_tail)
+                            key_pool.mark_success(a_key, usg, model=m_name)
+                            nat_finalized = True
+                        finally:
+                            await up.aclose()
+                            if not nat_finalized:
+                                key_pool.release(a_key, model=m_name)
+
+                    finalized_inner = True
+                    return (
+                        200,
+                        StreamingResponse(
+                            nat_stream(),
+                            status_code=200,
+                            media_type=up.headers.get("content-type"),
+                        ),
+                        "",
+                    )
+                else:
+                    try:
+                        usg = usage_metadata_from_payload(up.json())
+                    except Exception:
+                        usg = {}
+                    key_pool.mark_success(a_key, usg, model=m_name)
+                    finalized_inner = True
+                    record_trace(
+                        "Google Native",
+                        request.method,
+                        f"/v1beta/{google_path}",
+                        m_name,
+                        k_info["name"],
+                        200,
+                        (time.time() - req_start_time) * 1000,
+                        tokens=usg,
+                        route_mode=route_mode,
+                    )
+                    return (
+                        200,
+                        Response(
+                            content=up.content,
+                            status_code=200,
+                            media_type=up.headers.get("content-type"),
+                        ),
+                        "",
+                    )
+
+            err_b = await up.aread()
+            await up.aclose()
+            msg = google_error_message(up, err_b)
+            finalize_failed_response(a_key, up, msg, model=m_name)
+            finalized_inner = True
+            record_trace(
+                "Google Native",
+                request.method,
+                f"/v1beta/{google_path}",
+                m_name,
+                k_info["name"],
+                up.status_code,
+                (time.time() - req_start_time) * 1000,
+                route_mode=route_mode,
+                error=msg,
+            )
+            return up.status_code, None, msg
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            if not finalized_inner:
+                key_pool.mark_failure(
+                    a_key,
+                    reason=str(ex),
+                    cooldown_seconds=key_pool.transient_cooldown,
+                    model=m_name,
+                )
+                finalized_inner = True
+            return 500, None, str(ex)
+        finally:
+            if not finalized_inner:
+                key_pool.release(a_key, model=m_name)
+
+    try:
+        while time.time() - req_start_time < HEDGE_TIMEOUT_SECONDS:
+            if await request.is_disconnected():
+                for t in in_flight_tasks:
+                    t.cancel()
+                return native_google_error("Client cancelled request", 499)
+
+            while len(in_flight_tasks) < MAX_HEDGED_CONCURRENCY and cand_idx < len(candidates):
+                k_cand, m_cand = candidates[cand_idx]
+                cand_idx += 1
+                if not key_pool.can_consume_bool(k_cand, m_cand, check_concurrency=True):
+                    continue
+                acq = key_pool.acquire_key(
+                    model=m_cand,
+                    target_key_name=k_cand["name"],
+                    allow_transient_cooling=True,
+                )
+                if acq:
+                    task = asyncio.create_task(_execute_native_attempt(acq, m_cand))
+                    in_flight_tasks[task] = (acq, m_cand)
+                    break
+
+            if not in_flight_tasks:
+                if cand_idx >= len(candidates):
+                    if time.time() - req_start_time < HEDGE_TIMEOUT_SECONDS - 5.0:
+                        await asyncio.sleep(1.0)
+                        cand_idx = 0
+                        continue
+                    break
+                await asyncio.sleep(0.1)
+                continue
+
+            can_hedge_more = (
+                len(in_flight_tasks) < MAX_HEDGED_CONCURRENCY and cand_idx < len(candidates)
+            )
+            wait_timeout = (
+                HEDGE_INTERVAL_SECONDS
+                if can_hedge_more
+                else max(0.5, HEDGE_TIMEOUT_SECONDS - (time.time() - req_start_time))
+            )
+
+            done, _ = await asyncio.wait(
+                in_flight_tasks.keys(),
+                timeout=wait_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for finished_task in done:
+                f_key, f_model = in_flight_tasks.pop(finished_task)
+                try:
+                    code, resp_obj, err = finished_task.result()
+                    if code == 200 and resp_obj is not None:
+                        for other in in_flight_tasks:
+                            other.cancel()
+                        return resp_obj
+                    last_status = code
+                    last_error_msg = err
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    last_error_msg = str(e)
+    finally:
+        for t in in_flight_tasks:
+            t.cancel()
+
+    return native_google_error(
+        last_error_msg or "All candidate keys/models unavailable",
+        status_code=last_status,
+    )
 
 
 @app.get("/", response_class=FileResponse)
@@ -479,15 +920,13 @@ async def index():
 @app.get("/healthz")
 async def healthz():
     status = key_pool.get_status()
-    video_service = getattr(app.state, "video_service", None)
     return {
         "status": "ok" if status["available_keys"] else "degraded",
         "version": app.version,
         "available_keys": status["available_keys"],
         "total_keys": status["total_keys"],
         "default_model": DEFAULT_MODEL,
-        "mcp_endpoint": "/mcp/",
-        "video_jobs": len(video_service.jobs) if video_service else 0,
+        "recent_traces_count": len(REQUEST_TRACES),
     }
 
 
@@ -516,7 +955,6 @@ async def list_models(request: Request):
             finally:
                 key_pool.release(api_key)
 
-    # Merge official models with AVAILABLE_MODELS, preserving order and uniqueness
     model_ids = list(dict.fromkeys((_OFFICIAL_MODELS_CACHE["models"] or []) + AVAILABLE_MODELS))
     return {
         "object": "list",
@@ -536,212 +974,273 @@ async def get_status():
     status["auth_enabled"] = bool(PROXY_API_TOKEN)
     status["quota_summary"] = quota_status.get("summary_by_model", {})
     status["quota_reset_in_hours"] = quota_status.get("next_reset_in_hours")
-    video_service = getattr(app.state, "video_service", None)
-    jobs = list(video_service.jobs.values()) if video_service else []
-    status["mcp_endpoint"] = "/mcp/"
-    status["video_jobs"] = {
-        "total": len(jobs),
-        "running": sum(job.status in {"queued", "running"} for job in jobs),
-        "completed": sum(job.status == "completed" for job in jobs),
-        "failed": sum(job.status == "failed" for job in jobs),
-    }
-    status["supported_video_sources"] = [
-        "YouTube",
-        "抖音",
-        "哔哩哔哩",
-        "公开网页",
-        "本地文件",
-    ]
-    status["recent_video_jobs"] = [
-        {
-            "id": job.id,
-            "status": job.status,
-            "stage": job.stage,
-            "progress": round(job.progress, 3),
-            "analysis_type": job.analysis_type,
-            "source_type": job.source_type,
-            "title": (job.source_metadata or {}).get("title"),
-            "duration": (job.source_metadata or {}).get("duration"),
-            "model": job.model,
-            "key_name": job.key_name,
-            "error": job.error,
-            "created_at": job.created_at,
-            "updated_at": job.updated_at,
-        }
-        for job in sorted(jobs, key=lambda item: item.updated_at, reverse=True)[:8]
-    ]
+    status["recent_traces"] = list(REQUEST_TRACES)[:30]
+    status["total_traces"] = len(REQUEST_TRACES)
     return JSONResponse(content=status)
 
 
-@app.get("/v1/quota")
-@app.get("/stats/quota")
-async def get_quota_details():
-    return JSONResponse(content=key_pool.get_quota_status())
+@app.get("/v1/traces")
+async def get_traces():
+    """获取网关最近的请求审计流水。"""
+    return JSONResponse(content={"traces": list(REQUEST_TRACES)})
 
 
-class VideoAnalyzeRequest(BaseModel):
-    source: str
-    analysis_type: str = "general"
-    prompt: str | None = None
-    model: str = DEFAULT_MODEL
-    archive_dir: str | None = None
-    save_threshold: float = 7.0
-    source_metadata: dict | None = None
-
-
-@app.post("/v1/video/analyze")
-async def submit_video_analyze(request: Request, body: VideoAnalyzeRequest):
-    """提交一个真实原生视频分析任务 (Gemini Files API 完整视频上传+理解，非抽帧)。
-    立即返回 job_id，调用方需轮询 GET /v1/video/jobs/{job_id} 获取进度与结果。"""
+@app.post("/v1/keys/{key_name}/unfreeze")
+async def unfreeze_key(key_name: str, request: Request):
     require_proxy_auth(request)
-    video_service: VideoAnalysisService = request.app.state.video_service
-    try:
-        return JSONResponse(content=await video_service.submit(
-            source=body.source,
-            analysis_type=body.analysis_type,
-            prompt=body.prompt,
-            model=body.model,
-            archive_dir=body.archive_dir,
-            save_threshold=body.save_threshold,
-            source_metadata=body.source_metadata,
-        ))
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    success = key_pool.unfreeze_key(key_name)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Key '{key_name}' not found")
+    logger.info("Key '%s' manually unfrozen via dashboard API", key_name)
+    return {"status": "ok", "message": f"Key '{key_name}' 已成功解冻"}
 
 
-@app.get("/v1/video/jobs/{job_id}")
-async def get_video_job(request: Request, job_id: str):
-    """轮询获取视频分析任务的实时阶段 (queued/downloading/uploading/processing/analyzing/completed/failed) 与结果。"""
+@app.post("/v1/keys/{key_name}/toggle")
+async def toggle_key(key_name: str, request: Request):
     require_proxy_auth(request)
-    video_service: VideoAnalysisService = request.app.state.video_service
-    try:
-        return JSONResponse(content=video_service.get(job_id))
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    disabled = key_pool.toggle_key(key_name)
+    if disabled is None:
+        raise HTTPException(status_code=404, detail=f"Key '{key_name}' not found")
+    action_str = "禁用" if disabled else "启用"
+    logger.info("Key '%s' manually %s via dashboard API", key_name, action_str)
+    return {
+        "status": "ok",
+        "disabled": disabled,
+        "message": f"Key '{key_name}' 已{action_str}",
+    }
 
 
-@app.delete("/v1/video/jobs/{job_id}")
-async def cancel_video_job(request: Request, job_id: str):
-    """显式取消正在运行的视频分析任务，释放 API 资源并清理服务端临时文件。"""
+@app.post("/v1/keys/{key_name}/ping")
+async def ping_key(key_name: str, request: Request):
     require_proxy_auth(request)
-    video_service: VideoAnalysisService = request.app.state.video_service
+    key_info = key_pool.find_key_by_name(key_name)
+    if not key_info:
+        raise HTTPException(status_code=404, detail=f"Key '{key_name}' not found")
+
+    api_key = key_info["key"]
+    start_time = time.time()
     try:
-        return JSONResponse(content=await video_service.cancel(job_id))
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.get("/v1/video/analyze/stream/{job_id}")
-async def stream_video_job(request: Request, job_id: str):
-    """SSE 流式推送视频分析任务的实时阶段变化、Token 推流与最终结果。
-
-    通过 Server-Sent Events 实时广播：
-    - stage_update: 阶段与进度百分比变化
-    - stream_chunk: 大模型生成的实时文本片段 (直接端到端推流)
-    - completed: 分析完成与最终完整结果 JSON
-    - ping: 10 秒心跳保活，防止底层连接静默断开
-    """
-    require_proxy_auth(request)
-    video_service: VideoAnalysisService = request.app.state.video_service
-
-    try:
-        job = video_service.get(job_id)
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-
-    async def event_generator():
-        last_stage = None
-        last_progress = -1.0
-        last_ping_time = time.time()
-        stream_bytes_read = 0
-        stream_file = video_service.job_dir / f"{job_id}_stream.log"
-
-        while True:
-            try:
-                if await request.is_disconnected():
-                    break
-
-                job = video_service.get(job_id)
-                stage = job.get("stage", "")
-                status = job.get("status", "")
-                progress = float(job.get("progress") or 0.0)
-
-                # 1. 阶段或显著进度变更广播
-                should_push_stage = (stage != last_stage) or (abs(progress - last_progress) >= 0.02)
-                if should_push_stage:
-                    event_data = {
-                        "event": "stage_update",
-                        "stage": stage,
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+            )
+            latency_ms = round((time.time() - start_time) * 1000, 1)
+            if resp.status_code == 200:
+                models_health = {}
+                deprioritized = []
+                now_ts = time.time()
+                for m_name in CANONICAL_MODELS:
+                    q = key_pool._get_model_quota(key_info, m_name)
+                    limit_rpd = q.get("limit_rpd", 20)
+                    used_today = q.get("success_today", 0)
+                    ratio = (used_today / limit_rpd) if limit_rpd > 0 else 0.0
+                    is_deprioritized = ratio > 0.6 and (limit_rpd - used_today) > 0
+                    can_use, reason = key_pool.can_consume(key_info, m_name, check_concurrency=False, now=now_ts)
+                    status = (
+                        "Disabled"
+                        if key_info.get("disabled")
+                        else (
+                            "RateLimited"
+                            if q.get("cooldown_until", 0.0) > now_ts
+                            else ("Exhausted" if used_today >= limit_rpd else "Active")
+                        )
+                    )
+                    models_health[m_name] = {
+                        "can_consume": can_use,
+                        "reason": reason,
+                        "used_today": used_today,
+                        "limit_rpd": limit_rpd,
+                        "usage_ratio": round(ratio, 3),
                         "status": status,
-                        "progress": round(progress, 3),
-                        "timestamp": time.time(),
+                        "is_deprioritized": is_deprioritized,
                     }
-                    yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
-                    last_stage = stage
-                    last_progress = progress
-                    last_ping_time = time.time()
+                    if is_deprioritized:
+                        deprioritized.append(m_name)
 
-                # 2. 实时捕获并推送大模型 stream.log 新增生成的 token 片段
-                if stream_file.exists():
-                    try:
-                        file_size = stream_file.stat().st_size
-                        if file_size > stream_bytes_read:
-                            with open(stream_file, "r", encoding="utf-8", errors="ignore") as f:
-                                f.seek(stream_bytes_read)
-                                new_chunk = f.read()
-                                stream_bytes_read = f.tell()
-                            if new_chunk:
-                                chunk_event = {
-                                    "event": "stream_chunk",
-                                    "chunk": new_chunk,
-                                    "timestamp": time.time(),
-                                }
-                                yield f"data: {json.dumps(chunk_event, ensure_ascii=False)}\n\n"
-                                last_ping_time = time.time()
-                    except Exception:
-                        pass
+                return {
+                    "status": "ok",
+                    "status_code": 200,
+                    "latency_ms": latency_ms,
+                    "message": f"连通性正常 ({latency_ms}ms)",
+                    "auth_valid": True,
+                    "models_health": models_health,
+                    "deprioritized_models": deprioritized,
+                }
+            err_msg = google_error_message(resp)
+            return {
+                "status": "error",
+                "status_code": resp.status_code,
+                "latency_ms": latency_ms,
+                "message": err_msg,
+                "auth_valid": False,
+            }
+    except Exception as exc:
+        latency_ms = round((time.time() - start_time) * 1000, 1)
+        return {
+            "status": "error",
+            "status_code": 500,
+            "latency_ms": latency_ms,
+            "message": f"网络异常: {exc}",
+            "auth_valid": False,
+        }
 
-                # 3. 最终完成或失败状态广播
-                if status == "completed":
-                    final_event = {
-                        "event": "completed",
-                        "result": job.get("result"),
-                        "timestamp": time.time(),
+
+class BatchVerifyRequest(BaseModel):
+    model: str | None = None
+    models: list[str] | None = None
+    keys: list[str] | None = None
+    probe_type: str = "ping"
+
+
+class DeleteBatchesRequest(BaseModel):
+    batch_ids: list[str]
+
+
+@app.post("/v1/keys/verify-batch")
+async def verify_batch(req_data: BatchVerifyRequest, request: Request):
+    require_proxy_auth(request)
+    target_models = []
+    if req_data.models:
+        target_models = [normalize_model(m) for m in req_data.models if m]
+    elif req_data.model:
+        target_models = [normalize_model(req_data.model)]
+    if not target_models:
+        target_models = ["gemini-3.8-flash"]
+
+    probe_type = req_data.probe_type or "ping"
+
+    selected_keys = []
+    if req_data.keys:
+        for k_name in req_data.keys:
+            k = key_pool.find_key_by_name(k_name)
+            if k:
+                selected_keys.append(k)
+    else:
+        selected_keys = [k for k in key_pool.keys if not k.get("disabled")]
+
+    if not selected_keys:
+        raise HTTPException(status_code=400, detail="未选择任何有效 Key")
+
+    batch_id = f"batch_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    batch_start = time.time()
+
+    async def _test_single(key_info: dict, m_target: str) -> dict:
+        api_key = key_info["key"]
+        k_name = key_info["name"]
+        t0 = time.time()
+        now_ts = time.time()
+        can_consume, reason = key_pool.can_consume(key_info, m_target, check_concurrency=False, now=now_ts)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                if probe_type == "generate":
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_target}:generateContent?key={api_key}"
+                    payload = {
+                        "contents": [{"parts": [{"text": "Hi"}]}],
+                        "generationConfig": {"maxOutputTokens": 1},
                     }
-                    yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
-                    break
-                elif status in {"failed", "cancelled"}:
-                    fail_event = {
-                        "event": status,
-                        "error": job.get("error", ""),
-                        "timestamp": time.time(),
+                    resp = await client.post(url, json=payload)
+                else:
+                    # Health 探针 (GET models/{model}，验证权限且 0 配额消耗)
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_target}?key={api_key}"
+                    resp = await client.get(url)
+
+                lat = round((time.time() - t0) * 1000, 1)
+                if resp.status_code == 200:
+                    return {
+                        "key_name": k_name,
+                        "key_prefix": key_pool._mask_key(api_key),
+                        "model": m_target,
+                        "probe_type": probe_type,
+                        "status": "Success",
+                        "status_code": 200,
+                        "latency_ms": lat,
+                        "can_consume": can_consume,
+                        "reason": reason,
+                        "message": "生成连通测试正常 (HTTP 200)" if probe_type == "generate" else "模型支持且接口健康 (0额度消耗)",
                     }
-                    yield f"data: {json.dumps(fail_event, ensure_ascii=False)}\n\n"
-                    break
+                err_msg = google_error_message(resp)
+                if resp.status_code == 503:
+                    st = "HighDemand"
+                elif resp.status_code == 429:
+                    st = "RateLimited"
+                elif resp.status_code in (401, 403):
+                    st = "AuthError"
+                else:
+                    st = "Failed"
+                return {
+                    "key_name": k_name,
+                    "key_prefix": key_pool._mask_key(api_key),
+                    "model": m_target,
+                    "probe_type": probe_type,
+                    "status": st,
+                    "status_code": resp.status_code,
+                    "latency_ms": lat,
+                    "can_consume": can_consume,
+                    "reason": reason,
+                    "message": err_msg,
+                }
+        except Exception as e:
+            lat = round((time.time() - t0) * 1000, 1)
+            return {
+                "key_name": k_name,
+                "key_prefix": key_pool._mask_key(api_key),
+                "model": m_target,
+                "probe_type": probe_type,
+                "status": "Failed",
+                "status_code": 500,
+                "latency_ms": lat,
+                "can_consume": False,
+                "reason": "Exception",
+                "message": f"连接异常: {str(e)}",
+            }
 
-                # 4. 心跳保活 (每 10 秒无输出则推送 SSE ping 注释)
-                if time.time() - last_ping_time >= 10.0:
-                    yield ": ping\n\n"
-                    last_ping_time = time.time()
+    tasks = [
+        _test_single(k, m)
+        for k in selected_keys
+        for m in target_models
+    ]
+    records = await asyncio.gather(*tasks)
 
-                await asyncio.sleep(0.4)
-            except Exception as e:
-                logger.exception("[SSE_STREAM] Exception in event_generator: %s", e)
-                error_event = {"event": "error", "message": str(e)}
-                yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
-                break
+    success_cnt = sum(1 for r in records if r["status"] == "Success")
+    cooling_cnt = sum(1 for r in records if r["status"] in ("HighDemand", "RateLimited"))
+    failed_cnt = sum(1 for r in records if r["status"] in ("Failed", "AuthError"))
 
-        yield "data: {\"event\": \"done\"}\n\n"
+    models_display = ", ".join(target_models) if len(target_models) <= 3 else f"{len(target_models)} 款模型"
+    batch_record = {
+        "batch_id": batch_id,
+        "verified_at": int(batch_start),
+        "model": models_display,
+        "probe_type": probe_type,
+        "total": len(records),
+        "success_count": success_cnt,
+        "cooling_count": cooling_cnt,
+        "failed_count": failed_cnt,
+        "records": records,
+    }
+    key_pool.add_verification_batch(batch_record)
+    return batch_record
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
+
+@app.get("/v1/keys/verify-history")
+async def get_verify_history():
+    return {
+        "status": "ok",
+        "batches": key_pool.get_verification_batches(),
+    }
+
+
+@app.delete("/v1/keys/verify-history")
+async def delete_verify_batches(req_data: DeleteBatchesRequest, request: Request):
+    require_proxy_auth(request)
+    key_pool.delete_verification_batches(req_data.batch_ids)
+    return {"status": "ok", "deleted": req_data.batch_ids}
+
+
+@app.delete("/v1/keys/verify-history/{batch_id}")
+async def delete_single_verify_batch(batch_id: str, request: Request):
+    require_proxy_auth(request)
+    key_pool.delete_verification_batches([batch_id])
+    return {"status": "ok", "deleted": [batch_id]}
 
 
 @app.post("/v1/chat/completions")
@@ -754,35 +1253,51 @@ async def chat_completions(request: Request):
     created_at = int(time.time())
     base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
 
+    target_key = extract_target_key(request)
+    route_mode = extract_route_mode(request, openai_request)
+    fallbacks = extract_fallback_models(request, openai_request)
+
     logger.info(
-        "Request model=%s messages=%d tools=%d stream=%s",
+        "Request model=%s mode=%s target_key=%s messages=%d tools=%d stream=%s",
         model,
+        route_mode,
+        target_key or "auto",
         len(openai_request.get("messages", [])),
         len(openai_request.get("tools", [])),
         bool(openai_request.get("stream")),
     )
 
+    client = get_http_client(request)
+
     if openai_request.get("stream", False):
         return StreamingResponse(
             stream_with_retry(
-                request.app.state.http_client,
+                client,
                 base_url,
                 payload,
                 model,
                 chat_id,
                 created_at,
+                target_key=target_key,
+                request=request,
+                route_mode=route_mode,
+                custom_fallbacks=fallbacks,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     return await complete_with_retry(
-        request.app.state.http_client,
+        client,
         base_url,
         payload,
         model,
         chat_id,
         created_at,
+        target_key=target_key,
+        request=request,
+        route_mode=route_mode,
+        custom_fallbacks=fallbacks,
     )
 
 
@@ -823,28 +1338,41 @@ async def responses(request: Request):
     created_at = int(time.time())
     base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
 
+    target_key = extract_target_key(request)
+    route_mode = extract_route_mode(request, response_request)
+    fallbacks = extract_fallback_models(request, response_request)
+    client = get_http_client(request)
+
     if response_request.get("stream", False):
         return StreamingResponse(
             responses_stream_with_retry(
-                request.app.state.http_client,
+                client,
                 base_url,
                 payload,
                 model,
                 response_id,
                 created_at,
                 response_request,
+                target_key=target_key,
+                request=request,
+                route_mode=route_mode,
+                custom_fallbacks=fallbacks,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     chat_response = await complete_with_retry(
-        request.app.state.http_client,
+        client,
         base_url,
         payload,
         model,
         f"chatcmpl-{uuid.uuid4().hex[:12]}",
         created_at,
+        target_key=target_key,
+        request=request,
+        route_mode=route_mode,
+        custom_fallbacks=fallbacks,
     )
     if chat_response.status_code >= 400:
         return chat_response
@@ -863,85 +1391,232 @@ async def stream_with_retry(
     model: str,
     chat_id: str,
     created_at: int,
+    target_key: str | None = None,
+    request: Request | None = None,
+    route_mode: str = "01",
+    custom_fallbacks: list[str] | None = None,
 ):
-    for attempt in range(max(1, len(key_pool.keys))):
-        key_info = key_pool.acquire_key(model=model)
-        if not key_info:
-            break
+    start_time = time.time()
+    candidates = build_route_candidates(route_mode, model, target_key, custom_fallbacks)
+    if not candidates:
+        yield _sse_error(chat_id, created_at, model, "No healthy candidate key/model available")
+        yield "data: [DONE]\n\n"
+        return
 
+    winning_response: httpx.Response | None = None
+    winning_key: dict | None = None
+    winning_model: str = model
+
+    if route_mode == "11":
+        key_info, cand_model = candidates[0]
         api_key = key_info["key"]
-        finalized = False
-        usage = {}
-        try:
-            url = f"{base_url}:streamGenerateContent?alt=sse"
-            async with client.stream(
-                "POST", url, headers={"x-goog-api-key": api_key}, json=payload
-            ) as response:
-                if response.status_code != 200:
-                    body = await response.aread()
-                    message = google_error_message(response, body)
-                    action = finalize_failed_response(api_key, response, message, model=model)
+        key_name = key_info["name"]
+        winning_model = cand_model
+        attempt = 0
+        last_error = ""
+
+        while time.time() - start_time < MODE_11_TIMEOUT_SECONDS:
+            if request and await request.is_disconnected():
+                logger.info("Mode 11 stream: client disconnected.")
+                return
+
+            if not key_pool.can_consume_bool(key_info, cand_model, check_concurrency=False):
+                last_error = f"Daily quota exhausted for model {cand_model} on key {key_name}"
+                break
+
+            acquired = key_pool.acquire_key(model=cand_model, target_key_name=key_name, allow_transient_cooling=True)
+            if not acquired:
+                await asyncio.sleep(0.2)
+                continue
+
+            finalized = False
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{cand_model}:streamGenerateContent?alt=sse"
+                req_up = client.build_request("POST", url, headers={"x-goog-api-key": api_key}, json=payload)
+                upstream = await client.send(req_up, stream=True)
+                if upstream.status_code == 200:
+                    winning_response = upstream
+                    winning_key = acquired
+                    break
+
+                body = await upstream.aread()
+                await upstream.aclose()
+                msg = google_error_message(upstream, body)
+                last_error = msg
+                finalize_failed_response(api_key, upstream, msg, model=cand_model)
+                finalized = True
+
+                if upstream.status_code in (400, 401, 403, 404):
+                    break
+
+                backoff = min(1.0 * (2 ** min(attempt, 4)), 20.0)
+                attempt += 1
+                await asyncio.sleep(backoff)
+            except (httpx.HTTPError, OSError) as exc:
+                if not finalized:
+                    key_pool.mark_failure(api_key, reason=str(exc), cooldown_seconds=key_pool.transient_cooldown, model=cand_model)
                     finalized = True
-                    if action == "retry":
-                        logger.warning(
-                            "Attempt %d failed for %s: %s",
-                            attempt + 1,
-                            key_info["name"],
-                            message,
-                        )
-                        continue
-                    yield _sse_error(chat_id, created_at, model, message)
-                    yield "data: [DONE]\n\n"
+                last_error = f"Transport error: {exc}"
+                attempt += 1
+                await asyncio.sleep(1.0)
+            finally:
+                if not finalized and winning_response is None:
+                    key_pool.release(api_key, model=cand_model)
+
+        if not winning_response:
+            yield _sse_error(chat_id, created_at, cand_model, last_error or "Mode 11 stream retry timeout exceeded")
+            yield "data: [DONE]\n\n"
+            return
+
+    else:
+        cand_idx = 0
+        in_flight_tasks: dict[asyncio.Task, tuple[dict, str]] = {}
+        last_error = ""
+
+        async def _open_stream_attempt(k_info: dict, m_name: str) -> tuple[int, httpx.Response | None, str]:
+            a_key = k_info["key"]
+            finalized_inner = False
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:streamGenerateContent?alt=sse"
+                req_up = client.build_request("POST", url, headers={"x-goog-api-key": a_key}, json=payload)
+                up = await client.send(req_up, stream=True)
+                if up.status_code == 200:
+                    return 200, up, ""
+                b = await up.aread()
+                await up.aclose()
+                msg = google_error_message(up, b)
+                finalize_failed_response(a_key, up, msg, model=m_name)
+                finalized_inner = True
+                return up.status_code, None, msg
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                if not finalized_inner:
+                    key_pool.mark_failure(a_key, reason=str(ex), cooldown_seconds=key_pool.transient_cooldown, model=m_name)
+                    finalized_inner = True
+                return 500, None, str(ex)
+            finally:
+                if not finalized_inner:
+                    pass
+
+        try:
+            while time.time() - start_time < HEDGE_TIMEOUT_SECONDS:
+                if request and await request.is_disconnected():
+                    for t in in_flight_tasks:
+                        t.cancel()
                     return
 
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
+                while len(in_flight_tasks) < MAX_HEDGED_CONCURRENCY and cand_idx < len(candidates):
+                    k_cand, m_cand = candidates[cand_idx]
+                    cand_idx += 1
+                    if not key_pool.can_consume_bool(k_cand, m_cand, check_concurrency=True):
                         continue
-                    try:
-                        data = json.loads(line[6:])
-                    except ValueError:
-                        continue
-                    chunk_usage = usage_metadata_from_payload(data)
-                    if chunk_usage:
-                        usage = chunk_usage
-                    text_chunks, tool_calls, _ = extract_response_parts(data)
-                    if text_chunks:
-                        yield _sse_chunk(
-                            chat_id,
-                            created_at,
-                            model,
-                            {"content": "".join(text_chunks)},
-                        )
-                    if tool_calls:
-                        yield _sse_chunk(
-                            chat_id,
-                            created_at,
-                            model,
-                            {"tool_calls": tool_calls},
-                            "tool_calls",
-                        )
+                    acq = key_pool.acquire_key(model=m_cand, target_key_name=k_cand["name"], allow_transient_cooling=True)
+                    if acq:
+                        t = asyncio.create_task(_open_stream_attempt(acq, m_cand))
+                        in_flight_tasks[t] = (acq, m_cand)
+                        break
 
-                key_pool.mark_success(api_key, usage, model=model)
-                finalized = True
-                yield _sse_chunk(chat_id, created_at, model, {}, "stop")
-                yield "data: [DONE]\n\n"
-                return
-        except (httpx.HTTPError, OSError) as exc:
-            if not finalized:
-                key_pool.mark_failure(
-                    api_key,
-                    reason=f"Transport error: {exc}",
-                    cooldown_seconds=key_pool.transient_cooldown,
-                    model=model,
+                if not in_flight_tasks:
+                    if cand_idx >= len(candidates):
+                        if time.time() - start_time < HEDGE_TIMEOUT_SECONDS - 5.0:
+                            await asyncio.sleep(1.0)
+                            cand_idx = 0
+                            continue
+                        break
+                    await asyncio.sleep(0.1)
+                    continue
+
+                can_hedge_more = (len(in_flight_tasks) < MAX_HEDGED_CONCURRENCY and cand_idx < len(candidates))
+                wait_step = HEDGE_INTERVAL_SECONDS if can_hedge_more else max(0.5, HEDGE_TIMEOUT_SECONDS - (time.time() - start_time))
+
+                done, _ = await asyncio.wait(
+                    in_flight_tasks.keys(),
+                    timeout=wait_step,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                finalized = True
-            logger.warning("Streaming transport error for %s: %s", key_info["name"], exc)
-        finally:
-            if not finalized:
-                key_pool.release(api_key)
 
-    yield _sse_error(chat_id, created_at, model, "No healthy API key is available")
-    yield "data: [DONE]\n\n"
+                for f_task in done:
+                    f_key, f_model = in_flight_tasks.pop(f_task)
+                    try:
+                        code, up_stream, err = f_task.result()
+                        if code == 200 and up_stream:
+                            winning_response = up_stream
+                            winning_key = f_key
+                            winning_model = f_model
+                            for other in in_flight_tasks:
+                                other.cancel()
+                            break
+                        else:
+                            last_error = err
+                            key_pool.release(f_key["key"], model=f_model)
+                    except asyncio.CancelledError:
+                        key_pool.release(f_key["key"], model=f_model)
+                    except Exception as e:
+                        last_error = str(e)
+                        key_pool.release(f_key["key"], model=f_model)
+
+                if winning_response:
+                    break
+        finally:
+            for t in list(in_flight_tasks.keys()):
+                t.cancel()
+                k_t, m_t = in_flight_tasks.pop(t)
+                key_pool.release(k_t["key"], model=m_t)
+
+        if not winning_response:
+            yield _sse_error(chat_id, created_at, model, last_error or "All candidate stream connections failed")
+            yield "data: [DONE]\n\n"
+            return
+
+    w_api_key = winning_key["key"]
+    stream_finalized = False
+    usage = {}
+    try:
+        async for line in winning_response.aiter_lines():
+            if request and await request.is_disconnected():
+                logger.info("Client disconnected during stream. Cancelling upstream.")
+                break
+
+            if not line.startswith("data: "):
+                continue
+            try:
+                data = json.loads(line[6:])
+            except ValueError:
+                continue
+            chunk_usage = usage_metadata_from_payload(data)
+            if chunk_usage:
+                usage = chunk_usage
+            text_chunks, tool_calls, _ = extract_response_parts(data)
+            if text_chunks:
+                yield _sse_chunk(
+                    chat_id,
+                    created_at,
+                    winning_model,
+                    {"content": "".join(text_chunks)},
+                )
+            if tool_calls:
+                yield _sse_chunk(
+                    chat_id,
+                    created_at,
+                    winning_model,
+                    {"tool_calls": tool_calls},
+                    "tool_calls",
+                )
+
+        key_pool.mark_success(w_api_key, usage, model=winning_model)
+        stream_finalized = True
+        yield _sse_chunk(chat_id, created_at, winning_model, {}, "stop")
+        yield "data: [DONE]\n\n"
+    except Exception as exc:
+        if not stream_finalized:
+            key_pool.mark_failure(w_api_key, reason=f"Streaming transport error: {exc}", cooldown_seconds=key_pool.transient_cooldown, model=winning_model)
+            stream_finalized = True
+        logger.warning("Streaming error for %s: %s", winning_key["name"], exc)
+    finally:
+        await winning_response.aclose()
+        if not stream_finalized:
+            key_pool.release(w_api_key, model=winning_model)
 
 
 async def responses_stream_with_retry(
@@ -952,6 +1627,10 @@ async def responses_stream_with_retry(
     response_id: str,
     created_at: int,
     response_request: dict,
+    target_key: str | None = None,
+    request: Request | None = None,
+    route_mode: str = "01",
+    custom_fallbacks: list[str] | None = None,
 ):
     sequence = 0
     initial_response = response_envelope(
@@ -973,7 +1652,16 @@ async def responses_stream_with_retry(
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
     async for chunk in stream_with_retry(
-        client, base_url, payload, model, chat_id, created_at
+        client,
+        base_url,
+        payload,
+        model,
+        chat_id,
+        created_at,
+        target_key=target_key,
+        request=request,
+        route_mode=route_mode,
+        custom_fallbacks=custom_fallbacks,
     ):
         for line in chunk.splitlines():
             if not line.startswith("data: ") or line == "data: [DONE]":
@@ -1146,80 +1834,345 @@ async def complete_with_retry(
     model: str,
     chat_id: str,
     created_at: int,
+    target_key: str | None = None,
+    request: Request | None = None,
+    route_mode: str = "01",
+    custom_fallbacks: list[str] | None = None,
 ):
-    for attempt in range(max(1, len(key_pool.keys))):
-        key_info = key_pool.acquire_key(model=model)
-        if not key_info:
-            break
+    start_time = time.time()
+    candidates = build_route_candidates(route_mode, model, target_key, custom_fallbacks)
+    if not candidates:
+        return openai_error(
+            "No available candidate key/model matching routing policy",
+            503,
+            "service_unavailable",
+        )
 
+    # 1. Mode 11: Single Point Persistent Retry up to MODE_11_TIMEOUT_SECONDS
+    if route_mode == "11":
+        key_info, cand_model = candidates[0]
         api_key = key_info["key"]
-        finalized = False
+        key_name = key_info["name"]
+        attempt = 0
+        last_error_message = ""
+        last_status_code = 503
+
+        while time.time() - start_time < MODE_11_TIMEOUT_SECONDS:
+            if request and await request.is_disconnected():
+                logger.info("Mode 11: client disconnected. Aborting request.")
+                record_trace(
+                    "OpenAI Compat",
+                    "POST",
+                    "/v1/chat/completions",
+                    cand_model,
+                    key_name,
+                    499,
+                    (time.time() - start_time) * 1000,
+                    error="Client disconnected",
+                )
+                return openai_error("Client cancelled request", 499, "client_closed_request")
+
+            if not key_pool.can_consume_bool(key_info, cand_model, check_concurrency=False):
+                last_error_message = f"Daily quota exhausted for model {cand_model} on key {key_name}"
+                last_status_code = 429
+                break
+
+            acquired = key_pool.acquire_key(
+                model=cand_model,
+                target_key_name=key_name,
+                allow_transient_cooling=True,
+            )
+            if not acquired:
+                await asyncio.sleep(0.2)
+                continue
+
+            finalized = False
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{cand_model}:generateContent"
+                response = await client.post(
+                    url,
+                    headers={"x-goog-api-key": api_key},
+                    json=payload,
+                )
+                latency_ms = (time.time() - start_time) * 1000
+                if response.status_code == 200:
+                    data = response.json()
+                    text_chunks, tool_calls, finish_reason = extract_response_parts(data)
+                    usage = usage_metadata_from_payload(data)
+                    key_pool.mark_success(api_key, usage, model=cand_model)
+                    finalized = True
+                    record_trace(
+                        "OpenAI Compat",
+                        "POST",
+                        "/v1/chat/completions",
+                        cand_model,
+                        key_name,
+                        200,
+                        latency_ms,
+                        tokens=usage,
+                    )
+                    message = {"role": "assistant", "content": "".join(text_chunks) or None}
+                    if tool_calls:
+                        message["tool_calls"] = tool_calls
+                    return JSONResponse(
+                        content={
+                            "id": chat_id,
+                            "object": "chat.completion",
+                            "created": created_at,
+                            "model": cand_model,
+                            "system_fingerprint": key_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": message,
+                                    "finish_reason": finish_reason,
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": usage.get("promptTokenCount", 0),
+                                "completion_tokens": usage.get("candidatesTokenCount", 0),
+                                "total_tokens": usage.get("totalTokenCount", 0),
+                            },
+                        }
+                    )
+
+                msg = google_error_message(response)
+                last_error_message = msg
+                last_status_code = response.status_code
+                finalize_failed_response(api_key, response, msg, model=cand_model)
+                finalized = True
+                record_trace(
+                    "OpenAI Compat",
+                    "POST",
+                    "/v1/chat/completions",
+                    cand_model,
+                    key_name,
+                    response.status_code,
+                    latency_ms,
+                    error=msg,
+                )
+
+                if response.status_code in (400, 401, 403, 404):
+                    return openai_error(msg, response.status_code, "invalid_request_error")
+
+                backoff = min(1.0 * (2 ** min(attempt, 4)), 20.0)
+                remaining = max(0.0, MODE_11_TIMEOUT_SECONDS - (time.time() - start_time))
+                logger.warning(
+                    "Mode 11 [%s/%s] attempt %d failed (%d). Backing off %.1fs (%.1fs remaining)...",
+                    key_name,
+                    cand_model,
+                    attempt + 1,
+                    response.status_code,
+                    backoff,
+                    remaining,
+                )
+                attempt += 1
+                await asyncio.sleep(backoff)
+            except (httpx.HTTPError, OSError) as exc:
+                latency_ms = (time.time() - start_time) * 1000
+                if not finalized:
+                    key_pool.mark_failure(
+                        api_key,
+                        reason=str(exc),
+                        cooldown_seconds=key_pool.transient_cooldown,
+                        model=cand_model,
+                    )
+                    finalized = True
+                last_error_message = f"Transport error: {exc}"
+                last_status_code = 504
+                record_trace(
+                    "OpenAI Compat",
+                    "POST",
+                    "/v1/chat/completions",
+                    cand_model,
+                    key_name,
+                    504,
+                    latency_ms,
+                    error=str(exc),
+                )
+                attempt += 1
+                await asyncio.sleep(1.0)
+            finally:
+                if not finalized:
+                    key_pool.release(api_key, model=cand_model)
+
+        total_ms = (time.time() - start_time) * 1000
+        return openai_error(
+            last_error_message or "Mode 11 retry timeout exceeded",
+            last_status_code,
+            "service_unavailable",
+        )
+
+    # 2. Modes 10, 01, 00: Hedged Concurrency Racing
+    cand_idx = 0
+    in_flight_tasks: dict[asyncio.Task, tuple[dict, str]] = {}
+    last_error_msg = ""
+    last_status = 503
+
+    async def _execute_attempt(k_info: dict, m_name: str) -> tuple[int, dict | None, str, dict]:
+        a_key = k_info["key"]
+        k_name = k_info["name"]
+        finalized_inner = False
         try:
-            response = await client.post(
-                f"{base_url}:generateContent",
-                headers={"x-goog-api-key": api_key},
+            u_url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent"
+            t0 = time.time()
+            resp = await client.post(
+                u_url,
+                headers={"x-goog-api-key": a_key},
                 json=payload,
             )
-            if response.status_code != 200:
-                message = google_error_message(response)
-                action = finalize_failed_response(api_key, response, message, model=model)
-                finalized = True
-                if action == "retry":
-                    logger.warning(
-                        "Attempt %d failed for %s: %s",
-                        attempt + 1,
-                        key_info["name"],
-                        message,
-                    )
-                    continue
-                return openai_error(message, response.status_code, "invalid_request_error")
-
-            data = response.json()
-            text_chunks, tool_calls, finish_reason = extract_response_parts(data)
-            usage = usage_metadata_from_payload(data)
-            key_pool.mark_success(api_key, usage, model=model)
-            finalized = True
-
-            message = {"role": "assistant", "content": "".join(text_chunks) or None}
-            if tool_calls:
-                message["tool_calls"] = tool_calls
-
-            return JSONResponse(
-                content={
-                    "id": chat_id,
-                    "object": "chat.completion",
-                    "created": created_at,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": message,
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": usage.get("promptTokenCount", 0),
-                        "completion_tokens": usage.get("candidatesTokenCount", 0),
-                        "total_tokens": usage.get("totalTokenCount", 0),
-                    },
-                }
-            )
-        except (httpx.HTTPError, OSError, ValueError) as exc:
-            if not finalized:
-                key_pool.mark_failure(
-                    api_key,
-                    reason=f"Transport error: {exc}",
-                    cooldown_seconds=key_pool.transient_cooldown,
-                    model=model,
+            lat_ms = (time.time() - t0) * 1000
+            if resp.status_code == 200:
+                d = resp.json()
+                usg = usage_metadata_from_payload(d)
+                key_pool.mark_success(a_key, usg, model=m_name)
+                finalized_inner = True
+                record_trace(
+                    "OpenAI Compat",
+                    "POST",
+                    "/v1/chat/completions",
+                    m_name,
+                    k_name,
+                    200,
+                    lat_ms,
+                    tokens=usg,
+                    route_mode=route_mode,
                 )
-                finalized = True
-            logger.warning("Transport error for %s: %s", key_info["name"], exc)
+                return 200, d, "", usg
+            err_text = google_error_message(resp)
+            finalize_failed_response(a_key, resp, err_text, model=m_name)
+            finalized_inner = True
+            record_trace(
+                "OpenAI Compat",
+                "POST",
+                "/v1/chat/completions",
+                m_name,
+                k_name,
+                resp.status_code,
+                lat_ms,
+                route_mode=route_mode,
+                error=err_text,
+            )
+            return resp.status_code, None, err_text, {}
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            if not finalized_inner:
+                key_pool.mark_failure(
+                    a_key,
+                    reason=str(ex),
+                    cooldown_seconds=key_pool.transient_cooldown,
+                    model=m_name,
+                )
+                finalized_inner = True
+            return 500, None, str(ex), {}
         finally:
-            if not finalized:
-                key_pool.release(api_key)
+            if not finalized_inner:
+                key_pool.release(a_key, model=m_name)
+
+    try:
+        while time.time() - start_time < HEDGE_TIMEOUT_SECONDS:
+            if request and await request.is_disconnected():
+                for t in in_flight_tasks:
+                    t.cancel()
+                record_trace(
+                    "OpenAI Compat",
+                    "POST",
+                    "/v1/chat/completions",
+                    model,
+                    "N/A",
+                    499,
+                    (time.time() - start_time) * 1000,
+                    error="Client disconnected",
+                )
+                return openai_error("Client cancelled request", 499, "client_closed_request")
+
+            while len(in_flight_tasks) < MAX_HEDGED_CONCURRENCY and cand_idx < len(candidates):
+                k_candidate, m_candidate = candidates[cand_idx]
+                cand_idx += 1
+                if not key_pool.can_consume_bool(k_candidate, m_candidate, check_concurrency=True):
+                    continue
+                acq = key_pool.acquire_key(
+                    model=m_candidate,
+                    target_key_name=k_candidate["name"],
+                    allow_transient_cooling=True,
+                )
+                if acq:
+                    task = asyncio.create_task(_execute_attempt(acq, m_candidate))
+                    in_flight_tasks[task] = (acq, m_candidate)
+                    break
+
+            if not in_flight_tasks:
+                if cand_idx >= len(candidates):
+                    if time.time() - start_time < HEDGE_TIMEOUT_SECONDS - 5.0:
+                        await asyncio.sleep(1.0)
+                        cand_idx = 0
+                        continue
+                    break
+                await asyncio.sleep(0.1)
+                continue
+
+            can_hedge_more = (
+                len(in_flight_tasks) < MAX_HEDGED_CONCURRENCY and cand_idx < len(candidates)
+            )
+            wait_timeout = (
+                HEDGE_INTERVAL_SECONDS
+                if can_hedge_more
+                else max(0.5, HEDGE_TIMEOUT_SECONDS - (time.time() - start_time))
+            )
+
+            done, _ = await asyncio.wait(
+                in_flight_tasks.keys(),
+                timeout=wait_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for finished_task in done:
+                f_key, f_model = in_flight_tasks.pop(finished_task)
+                try:
+                    code, data, err, usage = finished_task.result()
+                    if code == 200 and data is not None:
+                        for other in in_flight_tasks:
+                            other.cancel()
+                        text_chunks, tool_calls, finish_reason = extract_response_parts(data)
+                        message = {"role": "assistant", "content": "".join(text_chunks) or None}
+                        if tool_calls:
+                            message["tool_calls"] = tool_calls
+                        return JSONResponse(
+                            content={
+                                "id": chat_id,
+                                "object": "chat.completion",
+                                "created": created_at,
+                                "model": f_model,
+                                "system_fingerprint": f_key["name"],
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "message": message,
+                                        "finish_reason": finish_reason,
+                                    }
+                                ],
+                                "usage": {
+                                    "prompt_tokens": usage.get("promptTokenCount", 0),
+                                    "completion_tokens": usage.get("candidatesTokenCount", 0),
+                                    "total_tokens": usage.get("totalTokenCount", 0),
+                                },
+                            }
+                        )
+                    last_status = code
+                    last_error_msg = err
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    last_error_msg = str(e)
+    finally:
+        for t in in_flight_tasks:
+            t.cancel()
 
     return openai_error(
-        "No healthy API key is available", 503, "service_unavailable"
+        last_error_msg or "All candidate keys/models unavailable",
+        last_status,
+        "service_unavailable",
     )
 
 

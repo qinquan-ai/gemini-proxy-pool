@@ -112,8 +112,8 @@ class AppHelperTests(unittest.TestCase):
         status = self.client.get("/v1/status")
         self.assertEqual(status.status_code, 200)
         self.assertEqual(status.json()["total_keys"], 1)
-        self.assertIn("哔哩哔哩", status.json()["supported_video_sources"])
-        self.assertIn("recent_video_jobs", status.json())
+        self.assertIn("default_model", status.json())
+        self.assertIn("models", status.json())
         self.assertEqual(self.client.get("/healthz").status_code, 200)
 
     def test_responses_rejects_server_side_history_lookup(self):

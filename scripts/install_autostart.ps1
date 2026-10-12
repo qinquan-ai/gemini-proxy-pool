@@ -23,7 +23,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description "Start the local StudioKey Gemini gateway and video MCP at user logon." `
+    -Description "Start the local StudioKey Gemini gateway at user logon." `
     -Force | Out-Null
 
 Write-Output "Registered scheduled task: $TaskName"

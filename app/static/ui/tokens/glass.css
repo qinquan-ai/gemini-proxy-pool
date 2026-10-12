@@ -1,0 +1,118 @@
+/* ============================================================
+ * StudioKey UI Tokens - 毛玻璃与微光设计令牌
+ * 严格参照 Tiktok_TransFlow 的 tokens/glass.css 规范
+ * ============================================================ */
+
+:root {
+  color-scheme: light;
+
+  /* 基础形状与动效 */
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-pill: 999px;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur: 240ms;
+
+  /* Light 主题色调 */
+  --app-bg: #f2f3f5;
+  --bg-base: #f2f3f5;
+  --bg-panel: #ffffff;
+  --bg-raised: #f7f8fa;
+  --bg-border: rgba(17, 17, 19, 0.08);
+
+  --fg: rgba(17, 17, 19, 0.94);
+  --fg-muted: rgba(17, 17, 19, 0.58);
+  --fg-subtle: rgba(17, 17, 19, 0.38);
+
+  --accent: #18181b;
+  --accent-fg: #ffffff;
+  --danger: #e5484d;
+  --warning: #f59e0b;
+  --success: #16a34a;
+  --info: #0284c7;
+
+  /* 实心主按钮成对反转 */
+  --btn-solid-bg: var(--accent);
+  --btn-solid-fg: var(--accent-fg);
+  --btn-solid-bg-hover: #27272a;
+  --btn-solid-fg-hover: #ffffff;
+
+  /* 毛玻璃基础变量 */
+  --glass-bg: rgba(255, 255, 255, 0.68);
+  --glass-bg-hover: rgba(255, 255, 255, 0.85);
+  --glass-bg-active: rgba(255, 255, 255, 0.95);
+  --glass-border: rgba(17, 17, 19, 0.08);
+  --glass-border-hover: rgba(17, 17, 19, 0.16);
+  --glass-highlight: rgba(255, 255, 255, 0.8);
+  --glass-blur: 20px;
+  --glass-shadow: 0 10px 30px -10px rgba(17, 17, 19, 0.08), 0 1px 3px rgba(0, 0, 0, 0.03);
+
+  /* 状态光晕 */
+  --glow-active: rgba(22, 163, 74, 0.25);
+  --glow-running: rgba(2, 132, 199, 0.35);
+  --glow-cooling: rgba(245, 158, 11, 0.3);
+  --glow-disabled: rgba(100, 116, 139, 0.2);
+}
+
+:root[data-theme="dark"], :root.dark {
+  color-scheme: dark;
+
+  /* Dark 主题色调 */
+  --app-bg: #090a0f;
+  --bg-base: #090a0f;
+  --bg-panel: #11131a;
+  --bg-raised: #181a24;
+  --bg-border: rgba(255, 255, 255, 0.08);
+
+  --fg: rgba(255, 255, 255, 0.95);
+  --fg-muted: rgba(255, 255, 255, 0.55);
+  --fg-subtle: rgba(255, 255, 255, 0.35);
+
+  --accent: #ffffff;
+  --accent-fg: #090a0f;
+  --danger: #f87171;
+  --warning: #fbbf24;
+  --success: #4ade80;
+  --info: #38bdf8;
+
+  --btn-solid-bg: #ffffff;
+  --btn-solid-fg: #090a0f;
+  --btn-solid-bg-hover: #e2e8f0;
+  --btn-solid-fg-hover: #090a0f;
+
+  /* 暗色毛玻璃 */
+  --glass-bg: rgba(20, 24, 33, 0.65);
+  --glass-bg-hover: rgba(28, 33, 46, 0.78);
+  --glass-bg-active: rgba(36, 42, 58, 0.88);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-hover: rgba(255, 255, 255, 0.18);
+  --glass-highlight: rgba(255, 255, 255, 0.12);
+  --glass-blur: 24px;
+  --glass-shadow: 0 16px 40px -12px rgba(0, 0, 0, 0.65), 0 1px 3px rgba(0, 0, 0, 0.4);
+
+  --glow-active: rgba(74, 222, 128, 0.28);
+  --glow-running: rgba(56, 189, 248, 0.4);
+  --glow-cooling: rgba(251, 191, 36, 0.35);
+  --glow-disabled: rgba(148, 163, 184, 0.18);
+}
+
+/* 玻璃表面基类 */
+.glass-surface {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  box-shadow: var(--glass-shadow), inset 0 1px 0 var(--glass-highlight);
+}
+
+/* 旋转光圈动效 */
+@keyframes glass-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pulse-ring {
+  0% { transform: scale(0.9); opacity: 0.8; }
+  50% { transform: scale(1.15); opacity: 0.4; }
+  100% { transform: scale(0.9); opacity: 0.8; }
+}

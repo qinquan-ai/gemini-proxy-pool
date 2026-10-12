@@ -34,22 +34,12 @@ logs/
 coverage.xml
 htmlcov/
 .playwright-cli/
-data/video_jobs/
-data/video_downloads/
 data/key_pool_state.json
 data/backlog/
-data/*.mp4
-data/test_workspace*/
-data/browser_profile/
+downloads/
 data/*
 
 # Root temporary debug & scratch scripts
 debug_*.py
-test_douyin.py
 test_keys.py
-test_video_analysis.py
-tests/test_stream_thinking.py
-tests/test_runaway_watchdog.py
-tests/test_stream_analysis.py
 scratch/
-*.mp4

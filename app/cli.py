@@ -184,82 +184,9 @@ def cmd_snapshot(args):
     print(f"[*] Snapshot ready for quota calibration: {saved_img}")
 
 
-def cmd_batch(args):
-    import asyncio
-    from app.core.parallel_analyzer import ParallelVideoAnalyzer
-    
-    analyzer = ParallelVideoAnalyzer(
-        concurrency_per_key=args.concurrency,
-        inter_request_delay=args.delay,
-    )
-    video_files = []
-    if args.dir:
-        v_dir = Path(args.dir)
-        if v_dir.exists():
-            video_files = [str(p) for p in v_dir.glob("*.mp4")]
-    if args.files:
-        video_files.extend(args.files)
-
-    if not video_files:
-        print("[!] 未找到可分析的视频文件。请通过 --dir 或 --files 指定。")
-        return
-
-    asyncio.run(analyzer.run_parallel_batch(
-        video_files=video_files,
-        analysis_type=args.type,
-        output_dir=args.output,
-    ))
-
-
-
-def cmd_download(args):
-    from app.core.video_downloader import VideoDownloader, VideoDownloadError
-
-    sources = args.sources
-    output_dir = Path(args.output).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    downloader = VideoDownloader(
-        cookies_from_browser=args.cookies_from_browser or "",
-    )
-
-    print("\n" + "=" * 68)
-    print(" [*] StudioKey Universal Video Downloader")
-    print(f"  Target Directory: {output_dir}")
-    print(f"  Total Videos:     {len(sources)}")
-    print("=" * 68 + "\n")
-
-    success_count = 0
-    for idx, source in enumerate(sources, 1):
-        print(f"[{idx}/{len(sources)}] Processing: {source}")
-        try:
-            saved_file, meta = downloader.download(
-                source=source,
-                output_dir=output_dir,
-                filename=args.filename if len(sources) == 1 else None,
-            )
-            size_mb = saved_file.stat().st_size / (1024 * 1024)
-            dur = meta.get("duration") or "N/A"
-            title = meta.get("title") or saved_file.stem
-            print(f"  [✓] Successfully downloaded: {saved_file.name}")
-            print(f"      Size: {size_mb:.2f} MB | Duration: {dur}s | Extractor: {meta.get('extractor', 'default')}\n")
-            success_count += 1
-        except Exception as e:
-            print(f"  [!] Failed: {e}\n")
-
-    print(f"[*] Finished: {success_count}/{len(sources)} downloaded successfully.\n")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="StudioKey Proxy CLI Management Tool")
+    parser = argparse.ArgumentParser(description="StudioKey Proxy Key & Quota Management Tool")
     subparsers = parser.add_subparsers(dest="subcommand", help="Available commands")
-
-    p_download = subparsers.add_parser("download", help="Download videos from Douyin/TikTok, YouTube, Bilibili, or web URLs")
-    p_download.add_argument("sources", nargs="+", help="One or more video URLs or share text")
-    p_download.add_argument("--output", "-o", default="downloads", help="Output directory (default: ./downloads)")
-    p_download.add_argument("--filename", "-f", help="Custom output filename (only for single video download)")
-    p_download.add_argument("--cookies-from-browser", default="", help="Load cookies from browser (e.g., chrome, edge)")
-    p_download.set_defaults(func=cmd_download)
 
     p_quota = subparsers.add_parser("quota", help="Display quota status (Level 1: Fast in-memory counter, Level 2: Live Playwright browser audit)")
     p_quota.add_argument("--level", "-l", type=int, choices=[1, 2], default=1, help="Inspection level: 1=Memory/JSON counter (<50ms, default), 2=Live Playwright browser snapshot & DOM audit (~8s)")
@@ -283,15 +210,6 @@ def main():
     p_snap.add_argument("--wait", type=int, default=8, help="Wait seconds for chart rendering")
     p_snap.add_argument("--output", "-o", help="Custom output image file path")
     p_snap.set_defaults(func=cmd_snapshot)
-
-    p_batch = subparsers.add_parser("batch", help="Run multi-account parallel video analysis")
-    p_batch.add_argument("--dir", help="Directory containing .mp4 video files")
-    p_batch.add_argument("--files", nargs="+", help="Explicit list of video files")
-    p_batch.add_argument("--concurrency", "-c", type=int, default=3, help="Max in-flight concurrency per account (default: 3, total 9 across 3 accounts)")
-    p_batch.add_argument("--delay", type=float, default=2.0, help="Inter-request delay in seconds to safeguard RPM (default: 2.0)")
-    p_batch.add_argument("--type", default="curation", help="Analysis type (curation, transcript, etc.)")
-    p_batch.add_argument("--output", "-o", help="Output directory for generated markdown reports")
-    p_batch.set_defaults(func=cmd_batch)
 
     args = parser.parse_args()
     if not args.subcommand:
