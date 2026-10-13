@@ -979,6 +979,12 @@ async def get_status():
     return JSONResponse(content=status)
 
 
+@app.get("/v1/quota")
+async def get_quota():
+    """获取模型配额状态摘要"""
+    return JSONResponse(content=key_pool.get_quota_status())
+
+
 @app.get("/v1/traces")
 async def get_traces():
     """获取网关最近的请求审计流水。"""
@@ -1850,6 +1856,11 @@ async def complete_with_retry(
 
     # 1. Mode 11: Single Point Persistent Retry up to MODE_11_TIMEOUT_SECONDS
     if route_mode == "11":
+        fail_fast = (
+            (request is not None and request.headers.get("x-retry-policy", "").lower() == "fail-fast")
+            or (request is not None and request.headers.get("x-client-mode", "").lower() == "pipeline")
+            or (request is not None and request.query_params.get("fail_fast", "").lower() in ("1", "true"))
+        )
         key_info, cand_model = candidates[0]
         api_key = key_info["key"]
         key_name = key_info["name"]
@@ -1875,6 +1886,8 @@ async def complete_with_retry(
             if not key_pool.can_consume_bool(key_info, cand_model, check_concurrency=False):
                 last_error_message = f"Daily quota exhausted for model {cand_model} on key {key_name}"
                 last_status_code = 429
+                if fail_fast:
+                    return openai_error(last_error_message, 429, "quota_exhausted")
                 break
 
             acquired = key_pool.acquire_key(
@@ -1883,6 +1896,8 @@ async def complete_with_retry(
                 allow_transient_cooling=True,
             )
             if not acquired:
+                if fail_fast:
+                    return openai_error(f"Key {key_name} currently in cooldown or concurrency limit", 429, "key_busy")
                 await asyncio.sleep(0.2)
                 continue
 
@@ -1955,6 +1970,9 @@ async def complete_with_retry(
                 if response.status_code in (400, 401, 403, 404):
                     return openai_error(msg, response.status_code, "invalid_request_error")
 
+                if fail_fast:
+                    return openai_error(msg, response.status_code, "upstream_error")
+
                 backoff = min(1.0 * (2 ** min(attempt, 4)), 20.0)
                 remaining = max(0.0, MODE_11_TIMEOUT_SECONDS - (time.time() - start_time))
                 logger.warning(
@@ -1990,6 +2008,8 @@ async def complete_with_retry(
                     latency_ms,
                     error=str(exc),
                 )
+                if fail_fast:
+                    return openai_error(f"Transport error: {exc}", 504, "transport_error")
                 attempt += 1
                 await asyncio.sleep(1.0)
             finally:
