@@ -19,7 +19,7 @@ Copy-Item .env.example .env
 python main.py
 ```
 
-Open `http://127.0.0.1:8000` for the dashboard and use `http://127.0.0.1:8000/v1` as the OpenAI-compatible base URL.
+Open `http://127.0.0.1:8008` for the dashboard and use `http://127.0.0.1:8008/v1` as the OpenAI-compatible base URL.
 
 Available compatibility endpoints:
 

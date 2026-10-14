@@ -127,10 +127,10 @@ async def lifespan(app: FastAPI):
     print()
     logger.info("=" * 60)
     logger.info("🚀 GEMINI PROXY GATEWAY ACTIVE (High-Throughput Pool)")
-    logger.info("👉 Web Dashboard:    http://localhost:8000")
-    logger.info("👉 Native Gemini:    http://localhost:8000/v1beta")
-    logger.info("👉 OpenAI Compat:    http://localhost:8000/v1")
-    logger.info("👉 Health Status:    http://localhost:8000/v1/status")
+    logger.info("👉 Web Dashboard:    http://localhost:8008")
+    logger.info("👉 Native Gemini:    http://localhost:8008/v1beta")
+    logger.info("👉 OpenAI Compat:    http://localhost:8008/v1")
+    logger.info("👉 Health Status:    http://localhost:8008/v1/status")
     logger.info("=" * 60)
     print()
     yield
@@ -156,7 +156,7 @@ allowed_origins = [
     origin.strip()
     for origin in os.getenv(
         "PROXY_CORS_ORIGINS",
-        "http://127.0.0.1:8000,http://localhost:8000,tauri://localhost",
+        "http://127.0.0.1:8008,http://localhost:8008,tauri://localhost",
     ).split(",")
     if origin.strip()
 ]

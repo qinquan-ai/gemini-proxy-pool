@@ -21,10 +21,10 @@ python main.py
 
 默认服务地址：
 
-- 仪表盘：`http://127.0.0.1:8000`
-- OpenAI 兼容接口：`http://127.0.0.1:8000/v1`
-- 健康检查：`http://127.0.0.1:8000/healthz`
-- API 文档：`http://127.0.0.1:8000/docs`
+- 仪表盘：`http://127.0.0.1:8008`
+- OpenAI 兼容接口：`http://127.0.0.1:8008/v1`
+- 健康检查：`http://127.0.0.1:8008/healthz`
+- API 文档：`http://127.0.0.1:8008/docs`
 
 仪表盘采用零构建的组件化 UI：`styles/tokens.css` 维护主题令牌，
 `ui/components.js` 提供可复用状态与指标组件，`dashboard.js` 只负责数据编排。
@@ -99,7 +99,7 @@ Authorization: Bearer replace-with-a-long-random-token
 Gemini 3 工具调用的加密 thought signature 会由网关按 call ID 短期保存在内存并自动回填，
 兼容无法透传该非标准字段的 OpenAI-compatible 客户端。
 Gemini CLI 0.51 可保留 `gemini-api-key` 认证模式，并设置
-`GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8000`，把内置主模型请求送入同一
+`GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8008`，把内置主模型请求送入同一
 4-Key 池；StudioKey 会忽略客户端占位 Key 并使用池中 Key。普通 CLI 不接受其内部的
 `gateway` 认证类型，直接选择该类型会报 `Invalid auth method selected.`。
 原生协议路径无需 OpenAI 格式转换。
@@ -139,7 +139,7 @@ model_provider = "studiokey"
 
 [model_providers.studiokey]
 name = "StudioKey Gemini Gateway"
-base_url = "http://127.0.0.1:8000/v1"
+base_url = "http://127.0.0.1:8008/v1"
 wire_api = "responses"
 ```
 
@@ -148,7 +148,7 @@ Token 放进同名环境变量。不要把真实 Gemini Key 配进客户端；�
 
 ## 视频分析 MCP
 
-MCP 地址：`http://127.0.0.1:8000/mcp/`
+MCP 地址：`http://127.0.0.1:8008/mcp/`
 
 提供四个工具：
 
@@ -181,7 +181,7 @@ B站与公开网页复用同一远程解析器。B站的分离音视频流由 `f
 powershell -ExecutionPolicy Bypass -File .\scripts\install_autostart.ps1
 ```
 
-任务会启动唯一的 `127.0.0.1:8000` 网关；如果健康检查发现已有实例则不会重复启动。
+任务会启动唯一的 `127.0.0.1:8008` 网关；如果健康检查发现已有实例则不会重复启动。
 移除自动启动使用 `scripts/uninstall_autostart.ps1`。
 
 调用示例：
@@ -194,7 +194,7 @@ $body = @{
 } | ConvertTo-Json -Depth 8
 
 Invoke-RestMethod `
-  -Uri http://127.0.0.1:8000/v1/chat/completions `
+  -Uri http://127.0.0.1:8008/v1/chat/completions `
   -Method Post `
   -ContentType application/json `
   -Body $body
@@ -208,7 +208,7 @@ Invoke-RestMethod `
 * 进入 Cursor 的 `Settings` -> `Models` 菜单。
 * 在 `Override OpenAI Base URL` 一栏中填写：
   ```text
-  http://localhost:8000/v1
+  http://localhost:8008/v1
   ```
 * API Key 填写任意字符（如 `sk-gemini-pool`）。
 * 在支持的模型列表中，确保添加并勾选了您在 `.env` 里开启的模型（如 `gemini-2.5-flash`、`gemini-3-flash-preview`）。
@@ -217,7 +217,7 @@ Invoke-RestMethod `
 * 进入 `设置` -> `语言模型` -> `OpenAI`。
 * 开启**自定义接口地址**，并填写：
   ```text
-  http://localhost:8000/v1
+  http://localhost:8008/v1
   ```
 * API Key 填写任意字符（如 `sk-gemini`）。
 * 保存后点击连接测试，并在模型列表中选择或添加目标模型。
@@ -225,14 +225,14 @@ Invoke-RestMethod `
 ### 3. NextChat (ChatGPT Next Web) 配置
 * 打开设置，在 **API 接口地址** 中填写：
   ```text
-  http://localhost:8000/v1
+  http://localhost:8008/v1
   ```
 * **API Key** 填写任意字符。
 * 自定义模型一栏中勾选并启用代理所支持的模型。
 
 ### 4. Cherry Studio 配置
 * 添加自定义模型提供商（选择 `OneAPI` 或 `OpenAI` 兼容格式）。
-* API 地址填入 `http://localhost:8000/v1`。
+* API 地址填入 `http://localhost:8008/v1`。
 * 密钥填写任意字符，添加对应的模型名即可开始使用。
 
 ## 高级运维与自动化 CLI 工具
