@@ -11,105 +11,158 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# 官方 Google AI Studio 主流模型配额与每日支持 Token 数 (Free Tier 标准)
-# limit_rpd: 每日请求次数上限
-# limit_tpd: 官网每日支持的 Token 上限 (Tokens Per Day)
-# tpm: 每分钟 Token 限额
+# 官方 Google AI Studio 模型配额（Free Tier）
+# 校准口径：AI Studio Rate Limit 页，2026-10-28 04:26 实测，详见 docs/gemini_rate_limits_status.md
+#   limit_rpm: 每分钟请求上限（令牌桶的 rate 来源）
+#   limit_rpd: 每日请求上限（配额记账口径）
+#   limit_tpd: 每日 Token 上限
+#   tpm:       每分钟 Token 限额
+#   tier:      模型族 lite | flash | text。既用于候选筛选（只允许同族互换），也用于展示。
+#              配额一律按模型自身的 limit_rpm/limit_rpd 记账，不由 tier 推导——
+#              2.5-flash-lite 属 lite 族但只有 10 RPM / 20 RPD。
+#
+# 已剔除（不得再出现在任何路由、候选、记账里）：
+#   gemini-2.0-flash / gemini-2.0-flash-lite / gemini-2.5-pro / gemini-1.5-flash / gemini-1.5-pro
+#   gemini-3-flash（该 ID 在 API 层 404，页面的 "Gemini 3 Flash" 实际对应 -preview）
 CANONICAL_MODELS = {
-    # 核心主力模型 (外层卡片默认展示，等高排版)
+    # ---------- Lite 梯队：15 RPM / 250K TPM / 500 RPD ----------
     "gemini-3.5-flash-lite": {
+        "limit_rpm": 15,
         "limit_rpd": 500,
         "limit_tpd": 10_000_000,
         "tpm": 250_000,
+        "tier": "lite",
         "is_core": True,
-        "category": "Lite 天花板",
+        "category": "Lite 主力",
     },
     "gemini-3.1-flash-lite": {
+        "limit_rpm": 15,
         "limit_rpd": 500,
         "limit_tpd": 10_000_000,
         "tpm": 250_000,
+        "tier": "lite",
         "is_core": True,
-        "category": "Lite 天花板",
+        "category": "Lite 备用",
     },
+    # ---------- 非 Lite 梯队：5 RPM / 250K TPM / 20 RPD ----------
     "gemini-3.8-flash": {
+        "limit_rpm": 5,
         "limit_rpd": 20,
         "limit_tpd": 3_000_000,
         "tpm": 250_000,
+        "tier": "flash",
         "is_core": True,
         "category": "旗舰 Flash",
     },
-    "gemini-3.5-flash": {
+    # 限流页已无条目，但 2026-10-28 实测可调用（返回 503 high demand，说明请求打到了模型，不是 404）。
+    # 按能力排 3.8 之后；拥堵由熔断摘除，不靠降序绕开。
+    "gemini-3.7-flash": {
+        "limit_rpm": 5,
         "limit_rpd": 20,
         "limit_tpd": 3_000_000,
         "tpm": 250_000,
+        "tier": "flash",
+        "is_core": False,
+        "category": "Flash 主力（页面未列）",
+    },
+    "gemini-3.6-flash": {
+        "limit_rpm": 5,
+        "limit_rpd": 20,
+        "limit_tpd": 3_000_000,
+        "tpm": 250_000,
+        "tier": "flash",
         "is_core": True,
         "category": "主力 Flash",
     },
-    # 扩展系列模型 (折叠收起，点击展开)
-    "gemini-3.7-flash": {
+    # 限流页已无条目，但 2026-10-28 实测 200 正常返回（1.5s）。仍属非 Lite 梯队，参与默认调度。
+    "gemini-3.5-flash": {
+        "limit_rpm": 5,
         "limit_rpd": 20,
         "limit_tpd": 3_000_000,
         "tpm": 250_000,
+        "tier": "flash",
         "is_core": False,
-        "category": "Flash 扩展",
-    },
-    "gemini-3.6-flash": {
-        "limit_rpd": 20,
-        "limit_tpd": 3_000_000,
-        "tpm": 250_000,
-        "is_core": False,
-        "category": "Flash 扩展",
-    },
-    "gemini-3-flash-preview": {
-        "limit_rpd": 20,
-        "limit_tpd": 3_000_000,
-        "tpm": 250_000,
-        "is_core": False,
-        "category": "Flash 扩展",
-    },
-    "gemma-4-31b-it": {
-        "limit_rpd": 14400,
-        "limit_tpd": 20_000_000,
-        "tpm": 15_000,
-        "is_core": False,
-        "category": "开源超大额度",
-    },
-    "gemma-4-26b-a4b-it": {
-        "limit_rpd": 14400,
-        "limit_tpd": 20_000_000,
-        "tpm": 15_000,
-        "is_core": False,
-        "category": "开源超大额度",
+        "category": "Flash 备用（页面未列）",
     },
     "gemini-2.5-flash": {
+        "limit_rpm": 5,
         "limit_rpd": 20,
         "limit_tpd": 10_000_000,
-        "tpm": 1_000_000,
+        "tpm": 250_000,
+        "tier": "flash",
         "is_core": False,
-        "category": "经典系列",
+        "category": "经典 Flash",
     },
+    # 名字带 Lite，但实测配额是 10 RPM / 20 RPD，只有 3.5-lite 的 1/25。
+    # 必须按非 Lite 记账，否则第 21 次就撞 429。
     "gemini-2.5-flash-lite": {
-        "limit_rpd": 500,
+        "limit_rpm": 10,
+        "limit_rpd": 20,
         "limit_tpd": 10_000_000,
-        "tpm": 1_000_000,
+        "tpm": 250_000,
+        "tier": "lite",
         "is_core": False,
-        "category": "经典系列",
+        "category": "经典 Lite（按非 Lite 记账）",
+    },
+    # ---------- 不常用：在支持数组内，但默认不参与自动降级 ----------
+    "gemini-3-flash-preview": {
+        "limit_rpm": 5,
+        "limit_rpd": 20,
+        "limit_tpd": 3_000_000,
+        "tpm": 250_000,
+        "tier": "flash",
+        "is_core": False,
+        "category": "预览通道",
+    },
+    "gemma-4-31b-it": {
+        "limit_rpm": 30,
+        "limit_rpd": 14400,
+        "limit_tpd": 20_000_000,
+        "tpm": 16_000,
+        "tier": "text",
+        "is_core": False,
+        "category": "开源文本（TPM 仅 16K）",
+    },
+    "gemma-4-26b-a4b-it": {
+        "limit_rpm": 30,
+        "limit_rpd": 14400,
+        "limit_tpd": 20_000_000,
+        "tpm": 16_000,
+        "tier": "text",
+        "is_core": False,
+        "category": "开源文本（TPM 仅 16K）",
     },
 }
+
+# 不常用模型：必须是 CANONICAL_MODELS 的子集。
+# 作用：显式指定模型名仍可路由，但自动降级链与默认候选集不包含它们。
+UNCOMMON_MODELS = (
+    "gemini-3-flash-preview",
+    "gemma-4-31b-it",
+    "gemma-4-26b-a4b-it",
+)
+
+# 常用模型 = 支持数组去掉不常用部分，保持定义顺序
+PRIMARY_MODELS = tuple(m for m in CANONICAL_MODELS if m not in UNCOMMON_MODELS)
 
 DEFAULT_MODEL_RPD = {m: meta["limit_rpd"] for m, meta in CANONICAL_MODELS.items()}
 DEFAULT_FALLBACK_RPD = 20
 DEFAULT_FALLBACK_TPD = 2_000_000
 
-# 模型并发安全上限配置 (基于官方 RPM/TPM 换算的单 Key 模型并发槽位数)
-# Flash/Lite 15 RPM，安全槽位配置为 3~4；旗舰 5 RPM 配置为 2
+# 单 Key 单模型并发槽位（旧限流机制的遗留项，P1 起由令牌桶接管，仅作 fallback）
+# 依据实测配额：15 RPM → 4，10 RPM → 3，5 RPM → 2，30 RPM → 4
 DEFAULT_MODEL_CONCURRENCY = {
-    "gemini-3.8-flash": 2,
-    "gemini-3.5-flash": 2,
     "gemini-3.5-flash-lite": 4,
     "gemini-3.1-flash-lite": 4,
-    "gemini-2.5-flash": 3,
-    "gemini-2.5-flash-lite": 4,
+    "gemini-3.8-flash": 2,
+    "gemini-3.7-flash": 2,
+    "gemini-3.6-flash": 2,
+    "gemini-3.5-flash": 2,
+    "gemini-2.5-flash": 2,
+    "gemini-2.5-flash-lite": 3,
+    "gemini-3-flash-preview": 2,
+    "gemma-4-31b-it": 4,
+    "gemma-4-26b-a4b-it": 4,
 }
 DEFAULT_FALLBACK_CONCURRENCY = 2
 
@@ -425,7 +478,17 @@ class KeyManager:
             if custom_fallbacks:
                 raw_candidates = [self._normalize_model(m) for m in custom_fallbacks if m]
             else:
-                raw_candidates = list(CANONICAL_MODELS.keys())
+                # 默认候选只取同族的常用模型：lite 只换 lite，flash 只换 flash，text 只换 text。
+                # 跨族一律不换——那要么烧 flash 的 20 RPD，要么把音频任务丢给 TPM 16K 的 gemma。
+                family = CANONICAL_MODELS.get(target_norm, {}).get("tier")
+                if family:
+                    raw_candidates = [
+                        m
+                        for m in PRIMARY_MODELS
+                        if CANONICAL_MODELS.get(m, {}).get("tier") == family
+                    ]
+                else:
+                    raw_candidates = list(PRIMARY_MODELS)
             if target_norm and target_norm not in raw_candidates:
                 raw_candidates.insert(0, target_norm)
 
