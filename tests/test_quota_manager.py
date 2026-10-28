@@ -42,27 +42,20 @@ class QuotaManagerTests(unittest.TestCase):
         self.assertEqual(summary["total_remaining"], 39)
 
     def test_key_rotation_on_model_exhaustion(self):
-        # Exhaust gemini-3.5-flash on key 1 (limit: 20)
-        key1 = self.manager.acquire_key(model="gemini-3.5-flash")
-        for _ in range(20):
-            self.manager.mark_success(key1["key"], model="gemini-3.5-flash")
+        # 账本按「发出即记」：每个 Key 20 RPD，两个 Key 共 40 次。
+        served = set()
+        for _ in range(40):
+            acq = self.manager.acquire_key(model="gemini-3.5-flash")
+            self.assertIsNotNone(acq)
+            served.add(acq["name"])
+            self.manager.mark_success(acq["key"], model="gemini-3.5-flash")
+        self.assertEqual(served, {"primary", "secondary"})
 
-        # Next acquire for gemini-3.5-flash should route to key 2
-        key2 = self.manager.acquire_key(model="gemini-3.5-flash")
-        self.assertIsNotNone(key2)
-        self.assertEqual(key2["name"], "secondary")
+        # 两个 Key 都耗尽后该模型不可用
+        self.assertIsNone(self.manager.acquire_key(model="gemini-3.5-flash"))
 
-        # Exhaust key 2 as well
-        for _ in range(20):
-            self.manager.mark_success(key2["key"], model="gemini-3.5-flash")
-
-        # Both keys exhausted for gemini-3.5-flash
-        exhausted = self.manager.acquire_key(model="gemini-3.5-flash")
-        self.assertIsNone(exhausted)
-
-        # But another model (e.g. gemini-3.6-flash or gemini-3.5-flash-lite) should STILL be available!
-        lite_key = self.manager.acquire_key(model="gemini-3.5-flash-lite")
-        self.assertIsNotNone(lite_key)
+        # 另一个模型仍有配额
+        self.assertIsNotNone(self.manager.acquire_key(model="gemini-3.5-flash-lite"))
 
     def test_daily_rollover_resets_quota_and_saves_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -72,8 +65,9 @@ class QuotaManagerTests(unittest.TestCase):
                 clock=self.clock,
                 state_file=state_file,
             )
-            key = mgr.acquire_key(model="gemini-3.5-flash")
             for _ in range(5):
+                key = mgr.acquire_key(model="gemini-3.5-flash")
+                self.assertIsNotNone(key)
                 mgr.mark_success(key["key"], model="gemini-3.5-flash")
 
             status = mgr.get_quota_status()

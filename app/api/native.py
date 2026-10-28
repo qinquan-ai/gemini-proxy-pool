@@ -1,38 +1,59 @@
+"""Google 原生协议入口：/v1beta/{path}。
+
+非流式与流式共用一条候选推进循环，区别只在读取响应体的方式：
+流式成功时租约延到流结束，由 ``_stream_response`` 负责最终结算。
+"""
+
 import asyncio
-import hmac
-import json
-import logging
-import os
-import re
 import time
-import uuid
-import traceback
-from collections import deque
-from contextlib import asynccontextmanager
-from datetime import datetime
-from urllib.parse import unquote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
-from pydantic import BaseModel
+from fastapi import Request
+from fastapi.responses import Response, StreamingResponse
 
-from app.core.key_manager import KeyManager, CANONICAL_MODELS
-from app.core.responses_adapter import (
-    chat_completion_to_response,
-    response_envelope,
-    responses_to_chat_request,
-    sse_event,
+from app.consumer.dispatch import (
+    AttemptResult,
+    outcome_from_status,
+    run_candidates,
+    slot_headers,
 )
-from app.core.thought_signatures import thought_signature_store
-from app.core.translator import openai_to_gemini, translate_tools
-from app.runtime import DEFAULT_MODEL, HEDGE_INTERVAL_SECONDS, HEDGE_TIMEOUT_SECONDS, MAX_HEDGED_CONCURRENCY, MODE_11_TIMEOUT_SECONDS, app, get_http_client, key_pool, record_trace
-from app.execution.classify import google_error_message, is_allowed_native_gemini_path, native_gemini_headers, native_google_error, usage_metadata_from_payload, usage_metadata_from_sse_tail
-from app.scheduling.policy import build_route_candidates, extract_fallback_models, extract_route_mode, extract_target_key
-from app.consumer.settlement import finalize_failed_response
+from app.execution.classify import (
+    google_error_message,
+    is_allowed_native_gemini_path,
+    native_gemini_headers,
+    native_google_error,
+    retry_after_seconds,
+    usage_metadata_from_payload,
+    usage_metadata_from_sse_tail,
+)
+from app.runtime import (
+    DEFAULT_MODEL,
+    app,
+    get_http_client,
+    key_pool,
+    record_trace,
+    slot_registry,
+)
+from app.scheduling.policy import DeadlineBelowFloor, parse_route_spec
+
+# 流式读取的单块最长间隔。首包之后不再用 TTFB 卡，避免误杀长思考。
+STREAM_READ_GAP_S = 60.0
+
+
+def _extract_model(google_path: str) -> str | None:
+    if "models/" not in google_path:
+        return None
+    part = google_path.split("models/", 1)[1]
+    return part.split(":", 1)[0].split("/", 1)[0]
+
+
+def _target_url(google_path: str, requested_model: str | None, cand_model: str) -> str:
+    if requested_model and requested_model in google_path:
+        path = google_path.replace(f"models/{requested_model}", f"models/{cand_model}")
+    else:
+        path = google_path
+    return f"https://generativelanguage.googleapis.com/v1beta/{path}"
+
 
 @app.api_route(
     "/v1beta/{google_path:path}", methods=["GET", "POST", "DELETE", "PATCH"]
@@ -41,397 +62,262 @@ async def native_gemini_gateway(google_path: str, request: Request):
     if not is_allowed_native_gemini_path(google_path):
         return native_google_error("Unsupported native Gemini endpoint", 404)
 
-    req_start_time = time.time()
     body = await request.body()
     is_stream = "streamGenerateContent" in google_path
+    is_metered = "countTokens" not in google_path
+    requested_model = _extract_model(google_path)
+    model_display = requested_model or DEFAULT_MODEL
     client = get_http_client(request)
+    start_time = time.time()
 
-    extracted_model = None
-    if "models/" in google_path:
-        m_part = google_path.split("models/", 1)[1]
-        extracted_model = m_part.split(":", 1)[0].split("/", 1)[0]
+    try:
+        spec = parse_route_spec(
+            request,
+            None,
+            model=model_display,
+            is_stream=is_stream,
+            timeouts_for=slot_registry.timeouts_for,
+        )
+    except DeadlineBelowFloor as exc:
+        return native_google_error(
+            f"X-Request-Timeout-Ms={exc.requested_s * 1000:.0f} is below the {exc.model} floor "
+            f"of {exc.floor_s * 1000:.0f} ms. Raise the timeout or switch to fail-fast.",
+            400,
+            headers={"X-Slot-Reason": "deadline_below_floor"},
+            extra={"reason": "deadline_below_floor", "floor_ms": int(exc.floor_s * 1000)},
+        )
 
-    model_display = extracted_model or DEFAULT_MODEL
+    if not is_metered:
+        return await _count_tokens(client, request, google_path, body, model_display, spec)
 
-    fail_fast = (
-        request.headers.get("x-retry-policy", "").lower() == "fail-fast"
-        or request.headers.get("x-client-mode", "").lower() == "pipeline"
-        or request.query_params.get("fail_fast", "").lower() in ("1", "true")
-    )
-    target_key = extract_target_key(request)
+    ttfb = slot_registry.timeouts_for(spec.model).ttfb_s or spec.timeout_s
 
-    if fail_fast:
-        key_info = key_pool.acquire_key(model=extracted_model, target_key_name=target_key)
-        if not key_info:
-            return native_google_error("No healthy API key available", 503)
-        api_key = key_info["key"]
-        key_name = key_info["name"]
-        finalized = False
-        target = f"https://generativelanguage.googleapis.com/v1beta/{google_path}"
+    async def attempt(key_info: dict, model: str, lease) -> AttemptResult:
+        target = _target_url(google_path, requested_model, model)
+        upstream_req = client.build_request(
+            request.method,
+            target,
+            params=list(request.query_params.multi_items()),
+            headers=native_gemini_headers(request, key_info["key"]),
+            content=body,
+        )
+        t0 = time.time()
         try:
-            upstream_req = client.build_request(
-                request.method,
-                target,
-                params=list(request.query_params.multi_items()),
-                headers=native_gemini_headers(request, api_key),
-                content=body,
-            )
-            upstream = await client.send(upstream_req, stream=is_stream)
-            if upstream.status_code >= 400:
-                err_b = await upstream.aread()
-                msg = google_error_message(upstream, err_b)
-                finalize_failed_response(api_key, upstream, msg, model=extracted_model)
-                finalized = True
-                await upstream.aclose()
-                return Response(
-                    content=err_b,
-                    status_code=upstream.status_code,
-                    media_type=upstream.headers.get("content-type"),
-                )
-
             if is_stream:
-                async def ff_stream():
-                    usage_tail = b""
-                    ff_finalized = False
-                    try:
-                        async for chunk in upstream.aiter_raw():
-                            usage_tail = (usage_tail + chunk)[-262_144:]
-                            yield chunk
-                        usg = usage_metadata_from_sse_tail(usage_tail)
-                        key_pool.mark_success(api_key, usg, model=extracted_model)
-                        ff_finalized = True
-                    finally:
-                        await upstream.aclose()
-                        if not ff_finalized:
-                            key_pool.release(api_key, model=extracted_model)
-
-                finalized = True
-                return StreamingResponse(
-                    ff_stream(),
-                    status_code=200,
-                    media_type=upstream.headers.get("content-type"),
+                upstream = await asyncio.wait_for(
+                    client.send(upstream_req, stream=True),
+                    timeout=min(ttfb, spec.timeout_s),
                 )
             else:
-                try:
-                    usg = usage_metadata_from_payload(upstream.json())
-                except Exception:
-                    usg = {}
-                key_pool.mark_success(api_key, usg, model=extracted_model)
-                finalized = True
-                return Response(
-                    content=upstream.content,
-                    status_code=200,
-                    media_type=upstream.headers.get("content-type"),
+                upstream = await client.send(
+                    upstream_req, stream=False, timeout=httpx.Timeout(spec.timeout_s)
                 )
-        finally:
-            if not finalized:
-                key_pool.release(api_key, model=extracted_model)
-
-    route_mode = extract_route_mode(request)
-    fallbacks = extract_fallback_models(request)
-    candidates = build_route_candidates(route_mode, model_display, target_key, fallbacks)
-    if not candidates:
-        return native_google_error(
-            "No available candidate key/model matching routing policy", 503
-        )
-
-    def _build_target_url(cand_m: str) -> str:
-        if extracted_model and extracted_model in google_path:
-            p = google_path.replace(f"models/{extracted_model}", f"models/{cand_m}")
-            return f"https://generativelanguage.googleapis.com/v1beta/{p}"
-        return f"https://generativelanguage.googleapis.com/v1beta/{google_path}"
-
-    if route_mode == "11":
-        key_info, cand_model = candidates[0]
-        api_key = key_info["key"]
-        key_name = key_info["name"]
-        attempt = 0
-        last_error_message = ""
-        last_status_code = 503
-
-        while time.time() - req_start_time < MODE_11_TIMEOUT_SECONDS:
-            if await request.is_disconnected():
-                return native_google_error("Client cancelled request", 499)
-
-            if not key_pool.can_consume_bool(key_info, cand_model, check_concurrency=False):
-                last_error_message = f"Daily quota exhausted for model {cand_model} on key {key_name}"
-                last_status_code = 429
-                break
-
-            acquired = key_pool.acquire_key(
-                model=cand_model,
-                target_key_name=key_name,
-                allow_transient_cooling=True,
+        except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+            return AttemptResult(
+                ok=False,
+                status=504,
+                error=f"Upstream timeout: {exc}",
+                outcome="timeout",
+                cost_ms=(time.time() - t0) * 1000,
             )
-            if not acquired:
-                await asyncio.sleep(0.2)
-                continue
+        except (httpx.HTTPError, OSError) as exc:
+            return AttemptResult(
+                ok=False,
+                status=504,
+                error=f"Transport error: {exc}",
+                outcome="server_error",
+                cost_ms=(time.time() - t0) * 1000,
+            )
 
-            target_url = _build_target_url(cand_model)
-            finalized = False
+        if upstream.status_code == 200:
+            if is_stream:
+                return AttemptResult(
+                    ok=True,
+                    status=200,
+                    payload=upstream,
+                    outcome="ok",
+                    defer_settle=True,
+                    cost_ms=(time.time() - t0) * 1000,
+                )
             try:
-                upstream_req = client.build_request(
-                    request.method,
-                    target_url,
-                    params=list(request.query_params.multi_items()),
-                    headers=native_gemini_headers(request, api_key),
-                    content=body,
-                )
-                upstream = await client.send(upstream_req, stream=is_stream)
+                usage = usage_metadata_from_payload(upstream.json())
+            except ValueError:
+                usage = {}
+            return AttemptResult(
+                ok=True,
+                status=200,
+                payload=upstream,
+                usage=usage,
+                outcome="ok",
+                cost_ms=(time.time() - t0) * 1000,
+            )
 
-                if upstream.status_code == 200:
-                    if is_stream:
-                        async def m11_stream():
-                            usage_tail = b""
-                            st_finalized = False
-                            try:
-                                async for chunk in upstream.aiter_raw():
-                                    if await request.is_disconnected():
-                                        break
-                                    usage_tail = (usage_tail + chunk)[-262_144:]
-                                    yield chunk
-                                usg = usage_metadata_from_sse_tail(usage_tail)
-                                key_pool.mark_success(api_key, usg, model=cand_model)
-                                st_finalized = True
-                            finally:
-                                await upstream.aclose()
-                                if not st_finalized:
-                                    key_pool.release(api_key, model=cand_model)
-
-                        finalized = True
-                        return StreamingResponse(
-                            m11_stream(),
-                            status_code=200,
-                            media_type=upstream.headers.get("content-type"),
-                        )
-                    else:
-                        try:
-                            usg = usage_metadata_from_payload(upstream.json())
-                        except Exception:
-                            usg = {}
-                        key_pool.mark_success(api_key, usg, model=cand_model)
-                        finalized = True
-                        return Response(
-                            content=upstream.content,
-                            status_code=200,
-                            media_type=upstream.headers.get("content-type"),
-                        )
-
-                err_b = await upstream.aread()
-                await upstream.aclose()
-                msg = google_error_message(upstream, err_b)
-                last_error_message = msg
-                last_status_code = upstream.status_code
-                finalize_failed_response(api_key, upstream, msg, model=cand_model)
-                finalized = True
-
-                if upstream.status_code in (400, 401, 403, 404):
-                    return Response(
-                        content=err_b,
-                        status_code=upstream.status_code,
-                        media_type=upstream.headers.get("content-type"),
-                    )
-
-                backoff = min(1.0 * (2 ** min(attempt, 4)), 20.0)
-                attempt += 1
-                await asyncio.sleep(backoff)
-            except (httpx.HTTPError, OSError) as exc:
-                if not finalized:
-                    key_pool.mark_failure(
-                        api_key,
-                        reason=str(exc),
-                        cooldown_seconds=key_pool.transient_cooldown,
-                        model=cand_model,
-                    )
-                    finalized = True
-                last_error_message = f"Transport error: {exc}"
-                attempt += 1
-                await asyncio.sleep(1.0)
-            finally:
-                if not finalized:
-                    key_pool.release(api_key, model=cand_model)
-
-        return native_google_error(
-            last_error_message or "Mode 11 retry timeout exceeded",
-            status_code=last_status_code,
+        err_body = await upstream.aread()
+        await upstream.aclose()
+        message = google_error_message(upstream, err_body)
+        status = upstream.status_code
+        return AttemptResult(
+            ok=False,
+            status=status,
+            error=message,
+            outcome=outcome_from_status(status),
+            payload=err_body,
+            cost_ms=(time.time() - t0) * 1000,
+            retry_after_s=retry_after_seconds(upstream) if status == 429 else None,
+            terminal=status in (400, 401, 403, 404),
         )
 
-    cand_idx = 0
-    in_flight_tasks: dict[asyncio.Task, tuple[dict, str]] = {}
-    last_error_msg = ""
-    last_status = 503
+    winner, result = await run_candidates(spec, slot_registry, key_pool, attempt)
+    headers = slot_headers(
+        spec,
+        model_used=winner.model if winner else "",
+        key_used=winner.key_name if winner else "",
+        result=result,
+        pool=key_pool,
+    )
 
-    async def _execute_native_attempt(
-        k_info: dict, m_name: str
-    ) -> tuple[int, Response | StreamingResponse | None, str]:
-        a_key = k_info["key"]
-        finalized_inner = False
-        t_url = _build_target_url(m_name)
+    if not result.ok:
+        record_trace(
+            "Google Native",
+            request.method,
+            f"/v1beta/{google_path}",
+            winner.model if winner else spec.model,
+            winner.key_name if winner else "N/A",
+            result.status or 503,
+            (time.time() - start_time) * 1000,
+            error=result.error,
+            route_mode=spec.label,
+        )
+        return native_google_error(
+            result.error or "All candidate keys/models unavailable",
+            result.status or 503,
+            headers=headers,
+            extra={"reason": result.reason} if result.reason else None,
+        )
+
+    if is_stream:
+        return _stream_response(
+            upstream=result.payload,
+            request=request,
+            lease=winner.lease,
+            attempt=winner,
+            spec=spec,
+            headers=headers,
+            start_time=start_time,
+            google_path=google_path,
+        )
+
+    upstream: httpx.Response = result.payload
+    record_trace(
+        "Google Native",
+        request.method,
+        f"/v1beta/{google_path}",
+        winner.model,
+        winner.key_name,
+        200,
+        (time.time() - start_time) * 1000,
+        tokens=result.usage,
+        route_mode=spec.label,
+    )
+    return Response(
+        content=upstream.content,
+        status_code=200,
+        media_type=upstream.headers.get("content-type"),
+        headers=headers,
+    )
+
+
+def _stream_response(
+    *,
+    upstream: httpx.Response,
+    request: Request,
+    lease,
+    attempt,
+    spec,
+    headers: dict,
+    start_time: float,
+    google_path: str,
+) -> StreamingResponse:
+    deadline = spec.deadline()
+
+    async def body_stream():
+        usage_tail = b""
+        outcome = "timeout"
         try:
-            req_up = client.build_request(
-                request.method,
-                t_url,
-                params=list(request.query_params.multi_items()),
-                headers=native_gemini_headers(request, a_key),
-                content=body,
+            iterator = upstream.aiter_raw()
+            while True:
+                if time.time() > deadline:
+                    break
+                try:
+                    chunk = await asyncio.wait_for(
+                        iterator.__anext__(), timeout=STREAM_READ_GAP_S
+                    )
+                except StopAsyncIteration:
+                    outcome = "ok"
+                    break
+                except asyncio.TimeoutError:
+                    break
+                usage_tail = (usage_tail + chunk)[-262_144:]
+                yield chunk
+        finally:
+            await upstream.aclose()
+            usage = usage_metadata_from_sse_tail(usage_tail) if outcome == "ok" else None
+            slot_registry.settle(
+                lease,
+                outcome,
+                usage=usage,
+                cost_ms=(time.time() - start_time) * 1000,
             )
-            up = await client.send(req_up, stream=is_stream)
-            if up.status_code == 200:
-                if is_stream:
-                    async def nat_stream():
-                        usage_tail = b""
-                        nat_finalized = False
-                        try:
-                            async for chunk in up.aiter_raw():
-                                if await request.is_disconnected():
-                                    break
-                                usage_tail = (usage_tail + chunk)[-262_144:]
-                                yield chunk
-                            usg = usage_metadata_from_sse_tail(usage_tail)
-                            key_pool.mark_success(a_key, usg, model=m_name)
-                            nat_finalized = True
-                        finally:
-                            await up.aclose()
-                            if not nat_finalized:
-                                key_pool.release(a_key, model=m_name)
-
-                    finalized_inner = True
-                    return (
-                        200,
-                        StreamingResponse(
-                            nat_stream(),
-                            status_code=200,
-                            media_type=up.headers.get("content-type"),
-                        ),
-                        "",
-                    )
-                else:
-                    try:
-                        usg = usage_metadata_from_payload(up.json())
-                    except Exception:
-                        usg = {}
-                    key_pool.mark_success(a_key, usg, model=m_name)
-                    finalized_inner = True
-                    record_trace(
-                        "Google Native",
-                        request.method,
-                        f"/v1beta/{google_path}",
-                        m_name,
-                        k_info["name"],
-                        200,
-                        (time.time() - req_start_time) * 1000,
-                        tokens=usg,
-                        route_mode=route_mode,
-                    )
-                    return (
-                        200,
-                        Response(
-                            content=up.content,
-                            status_code=200,
-                            media_type=up.headers.get("content-type"),
-                        ),
-                        "",
-                    )
-
-            err_b = await up.aread()
-            await up.aclose()
-            msg = google_error_message(up, err_b)
-            finalize_failed_response(a_key, up, msg, model=m_name)
-            finalized_inner = True
             record_trace(
                 "Google Native",
                 request.method,
                 f"/v1beta/{google_path}",
-                m_name,
-                k_info["name"],
-                up.status_code,
-                (time.time() - req_start_time) * 1000,
-                route_mode=route_mode,
-                error=msg,
+                attempt.model,
+                attempt.key_name,
+                200 if outcome == "ok" else 504,
+                (time.time() - start_time) * 1000,
+                tokens=usage or {},
+                route_mode=spec.label,
+                error="" if outcome == "ok" else "stream ended before completion",
             )
-            return up.status_code, None, msg
-        except asyncio.CancelledError:
-            raise
-        except Exception as ex:
-            if not finalized_inner:
-                key_pool.mark_failure(
-                    a_key,
-                    reason=str(ex),
-                    cooldown_seconds=key_pool.transient_cooldown,
-                    model=m_name,
-                )
-                finalized_inner = True
-            return 500, None, str(ex)
-        finally:
-            if not finalized_inner:
-                key_pool.release(a_key, model=m_name)
 
+    return StreamingResponse(
+        body_stream(),
+        status_code=200,
+        media_type=upstream.headers.get("content-type"),
+        headers=headers,
+    )
+
+
+async def _count_tokens(
+    client: httpx.AsyncClient,
+    request: Request,
+    google_path: str,
+    body: bytes,
+    model: str,
+    spec,
+):
+    """countTokens 不生成内容，不占令牌、不记 RPD，直发第一个可用 Key。"""
+    key_info = next((k for k in key_pool.keys if not k.get("disabled")), None)
+    if key_info is None:
+        return native_google_error("No healthy API key available", 503)
+    target = _target_url(google_path, model, model)
+    upstream_req = client.build_request(
+        request.method,
+        target,
+        params=list(request.query_params.multi_items()),
+        headers=native_gemini_headers(request, key_info["key"]),
+        content=body,
+    )
     try:
-        while time.time() - req_start_time < HEDGE_TIMEOUT_SECONDS:
-            if await request.is_disconnected():
-                for t in in_flight_tasks:
-                    t.cancel()
-                return native_google_error("Client cancelled request", 499)
-
-            while len(in_flight_tasks) < MAX_HEDGED_CONCURRENCY and cand_idx < len(candidates):
-                k_cand, m_cand = candidates[cand_idx]
-                cand_idx += 1
-                if not key_pool.can_consume_bool(k_cand, m_cand, check_concurrency=True):
-                    continue
-                acq = key_pool.acquire_key(
-                    model=m_cand,
-                    target_key_name=k_cand["name"],
-                    allow_transient_cooling=True,
-                )
-                if acq:
-                    task = asyncio.create_task(_execute_native_attempt(acq, m_cand))
-                    in_flight_tasks[task] = (acq, m_cand)
-                    break
-
-            if not in_flight_tasks:
-                if cand_idx >= len(candidates):
-                    if time.time() - req_start_time < HEDGE_TIMEOUT_SECONDS - 5.0:
-                        await asyncio.sleep(1.0)
-                        cand_idx = 0
-                        continue
-                    break
-                await asyncio.sleep(0.1)
-                continue
-
-            can_hedge_more = (
-                len(in_flight_tasks) < MAX_HEDGED_CONCURRENCY and cand_idx < len(candidates)
-            )
-            wait_timeout = (
-                HEDGE_INTERVAL_SECONDS
-                if can_hedge_more
-                else max(0.5, HEDGE_TIMEOUT_SECONDS - (time.time() - req_start_time))
-            )
-
-            done, _ = await asyncio.wait(
-                in_flight_tasks.keys(),
-                timeout=wait_timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            for finished_task in done:
-                f_key, f_model = in_flight_tasks.pop(finished_task)
-                try:
-                    code, resp_obj, err = finished_task.result()
-                    if code == 200 and resp_obj is not None:
-                        for other in in_flight_tasks:
-                            other.cancel()
-                        return resp_obj
-                    last_status = code
-                    last_error_msg = err
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    last_error_msg = str(e)
-    finally:
-        for t in in_flight_tasks:
-            t.cancel()
-
-    return native_google_error(
-        last_error_msg or "All candidate keys/models unavailable",
-        status_code=last_status,
+        upstream = await client.send(
+            upstream_req, stream=False, timeout=httpx.Timeout(spec.timeout_s)
+        )
+    except (httpx.HTTPError, OSError) as exc:
+        return native_google_error(f"Transport error: {exc}", 504)
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type"),
+        headers=slot_headers(spec, model_used=model, pool=key_pool),
     )

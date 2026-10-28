@@ -71,13 +71,30 @@ Authorization: Bearer replace-with-a-long-random-token
 
 ## 号池行为
 
-- 健康 Key 使用线程安全的 round-robin 分配。
-- `429` 优先采用 Google 返回的 `Retry-After` / `retryDelay`。
-- `401` 会禁用无效 Key，直到服务重启。
-- `403` 进入短期权限冷却，不永久误伤整把 Key。
-- 网络错误和 Google `5xx` 使用短暂冷却并切换下一把 Key。
-- 客户端 `400/404` 不会降低 Key 健康度。
-- 全部 Key 冷却或禁用时返回 `503`，不会继续请求已耗尽 Key。
+限速按 `(key, model)` 的令牌桶执行，账本按「发出即记」：
+
+```text
+rate  = rpm × 0.8 / 60          个/秒
+burst = round(rpm × 0.2)        至少 1
+保证：任意 60 秒窗口内发给上游的请求数 ≤ rpm
+```
+
+- 候选严格按调用方给的 `X-Fallback-Models` 数组顺序 first-fit，不排序、不打分、不回头。
+- 选 Key 按 `in_flight → used_today` 排序，Key 之间等价，才适合摊负载。
+- `2xx / 5xx / 超时 / 客户端断开` 都记一次 `used_today`；`4xx`（除 429）与网关侧取消不记。
+  依据是实测：3.8-flash 连续四次调用全失败，RPD 仍从 0/20 涨到 6/20。
+- `429` 优先采用 Google 返回的 `Retry-After` / `retryDelay`，上限 30 秒。
+- 同一槽位连续 2 次超时或 `5xx` 熔断 300 秒，成功一次清零。
+- `401` 会禁用无效 Key，直到服务重启；`403` 进入短期权限冷却。
+- 并发数不是闸门。原来写死的 `DEFAULT_MODEL_CONCURRENCY` 已删除，吞吐只由令牌与 RPD 决定。
+- 全部候选不可用时返回 `429`（带 `X-Slot-Reason` 与 `X-Slot-Retry-After-Ms`），不再无限重扫。
+
+请求超时分三档（lite 20/40/90 秒，flash 45/90/180 秒，text 40/75/150 秒）。
+调用方用 `X-Request-Timeout-Ms` 报预算：低于 floor 直接 `400 deadline_below_floor`
+（不占槽、不扣令牌、不记账），高于 ceiling 截断执行。
+
+`RATE_LIMIT_MODE` 控制限速生效程度：`off`（等同旧行为）、`shadow`（默认，照算照记但不拦）、
+`enforce`（全生效）。本地真值文档见 `docs/gateway_p1_rate_limit.md`（该目录不入库）。
 
 ## API
 
@@ -85,7 +102,8 @@ Authorization: Bearer replace-with-a-long-random-token
 |---|---|---|
 | `GET` | `/` | 可视化号池仪表盘 |
 | `GET` | `/healthz` | 轻量健康检查 |
-| `GET` | `/v1/status` | 号池、请求、失败、冷却与在途统计 |
+| `GET` | `/v1/status` | 号池、模型聚合额度、限速模式、令牌与在途统计 |
+| `GET` | `/v1/quota` | 额度摘要；带 `?model=` 返回逐 Key 的令牌、冷却与耗时明细 |
 | `GET` | `/v1/models` | 配置允许的模型列表 |
 | `POST` | `/v1/chat/completions` | OpenAI 兼容对话接口 |
 | `POST` | `/v1/responses` | OpenAI Responses 兼容接口（无服务端历史存储） |
@@ -107,21 +125,25 @@ Gemini CLI 0.51 可保留 `gemini-api-key` 认证模式，并设置
 ## 网关调用链
 
 ```text
-Codex / OpenCode / Aider
-        │ OpenAI Chat 或 Responses 请求
+Codex / OpenCode / Aider / TransFlow
+        │ OpenAI Chat、Responses 或原生 Gemini 请求
         ▼
-FastAPI 鉴权与模型校验
+准入（api）：鉴权、模型校验、超时区间裁决
         ▼
-协议适配器（OpenAI → Gemini）
+producer：请求体构造 + RouteSpec（模型数组、两个路由开关、预算）
         ▼
-KeyManager 轮询健康 Key
+scheduling：候选构造（first-fit）+ 令牌桶授予
+        ▼
+consumer/dispatch：逐个候选执行，每次尝试独立 acquire / settle
         ▼
 Gemini generateContent / streamGenerateContent
         ▼
-错误分类、冷却、自动切换下一 Key
+结算（quota）：used_today、冷却、熔断、最近 20 次耗时
         ▼
-OpenAI Chat / Responses 格式返回客户端
+OpenAI Chat / Responses / 原生格式返回客户端
 ```
+
+单次逻辑请求只有一条执行路径，不再有「四个模式 + 对冲三并发」的分叉。
 
 它目前属于单厂商 Gemini 网关，不是完整的多厂商路由器。所有入口共享一个 Key 池，
 因此不会因为增加客户端而绕过项目配额，只会获得统一的故障切换和协议兼容。

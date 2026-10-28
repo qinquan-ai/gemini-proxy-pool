@@ -145,26 +145,22 @@ UNCOMMON_MODELS = (
 # 常用模型 = 支持数组去掉不常用部分，保持定义顺序
 PRIMARY_MODELS = tuple(m for m in CANONICAL_MODELS if m not in UNCOMMON_MODELS)
 
+# 已废除的模型：状态文件里可能留着历史消耗记录，但不得再出现在候选、面板与额度接口里
+DEPRECATED_MODELS = frozenset(
+    {
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-2.5-pro",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+        "gemini-3-flash",
+        "gemini-3.1-pro-preview",
+    }
+)
+
 DEFAULT_MODEL_RPD = {m: meta["limit_rpd"] for m, meta in CANONICAL_MODELS.items()}
 DEFAULT_FALLBACK_RPD = 20
 DEFAULT_FALLBACK_TPD = 2_000_000
-
-# 单 Key 单模型并发槽位（旧限流机制的遗留项，P1 起由令牌桶接管，仅作 fallback）
-# 依据实测配额：15 RPM → 4，10 RPM → 3，5 RPM → 2，30 RPM → 4
-DEFAULT_MODEL_CONCURRENCY = {
-    "gemini-3.5-flash-lite": 4,
-    "gemini-3.1-flash-lite": 4,
-    "gemini-3.8-flash": 2,
-    "gemini-3.7-flash": 2,
-    "gemini-3.6-flash": 2,
-    "gemini-3.5-flash": 2,
-    "gemini-2.5-flash": 2,
-    "gemini-2.5-flash-lite": 3,
-    "gemini-3-flash-preview": 2,
-    "gemma-4-31b-it": 4,
-    "gemma-4-26b-a4b-it": 4,
-}
-DEFAULT_FALLBACK_CONCURRENCY = 2
 
 # Google AI Studio resets free quotas daily at 00:00 Pacific Time (PT)
 # PT in daylight saving time is PDT (UTC-7)
@@ -402,7 +398,7 @@ class KeyManager:
                     continue
                 if normalized:
                     m_quota = self._get_model_quota(k, normalized)
-                    if m_quota.get("success_today", 0) >= m_quota.get("limit_rpd", DEFAULT_FALLBACK_RPD):
+                    if m_quota.get("used_today", 0) >= m_quota.get("limit_rpd", DEFAULT_FALLBACK_RPD):
                         continue
                     cd = m_quota.get("cooldown_until", 0.0) - now
                     if 0 < cd <= 5.0:
@@ -434,16 +430,13 @@ class KeyManager:
         if m:
             m_quota = self._get_model_quota(key_info, m)
             limit_rpd = m_quota.get("limit_rpd", DEFAULT_FALLBACK_RPD)
-            used_rpd = m_quota.get("success_today", 0)
+            used_rpd = m_quota.get("used_today", 0)
             if used_rpd >= limit_rpd:
                 return False, "RpdExhausted"
             if m_quota.get("cooldown_until", 0.0) > cur_time:
                 return False, "ModelCooling"
-            if check_concurrency:
-                m_in_flight = key_info.get("model_in_flight", {}).get(m, 0)
-                m_limit = DEFAULT_MODEL_CONCURRENCY.get(m, DEFAULT_FALLBACK_CONCURRENCY)
-                if m_in_flight >= m_limit:
-                    return False, "ModelConcurrencyFull"
+        # 并发数不再是准入条件：P1 起由 TokenBucket 的令牌与 RPD 共同决定吞吐。
+        # check_concurrency 参数保留只为不破坏调用方签名。
         return True, "Available"
  
     def can_consume_bool(
@@ -505,13 +498,13 @@ class KeyManager:
             for m in candidates:
                 if key_info:
                     q = self._get_model_quota(key_info, m)
-                    used_rpd = q.get("success_today", 0)
+                    used_rpd = q.get("used_today", 0)
                     limit_rpd = q.get("limit_rpd", DEFAULT_FALLBACK_RPD)
                     is_cooling = q.get("cooldown_until", 0.0) > now
                 else:
                     active_keys = [k for k in self.keys if not k.get("disabled")]
                     if active_keys:
-                        used_rpd = sum(self._get_model_quota(k, m).get("success_today", 0) for k in active_keys) // len(active_keys)
+                        used_rpd = sum(self._get_model_quota(k, m).get("used_today", 0) for k in active_keys) // len(active_keys)
                         limit_rpd = CANONICAL_MODELS.get(m, {}).get("limit_rpd", DEFAULT_FALLBACK_RPD)
                         is_cooling = all(self._get_model_quota(k, m).get("cooldown_until", 0.0) > now for k in active_keys)
                     else:
@@ -585,18 +578,13 @@ class KeyManager:
                     if not key_info["disabled"] and key_info["cooldown_until"] <= now:
                         if normalized_model:
                             m_quota = self._get_model_quota(key_info, normalized_model)
-                            if m_quota["success_today"] >= m_quota["limit_rpd"]:
+                            if m_quota["used_today"] >= m_quota["limit_rpd"]:
                                 return None
                             if allow_transient_cooling:
                                 if m_quota.get("cooldown_until", 0.0) > now + 15.0:
                                     return None
                             elif m_quota.get("cooldown_until", 0.0) > now:
                                 return None
-                            if check_concurrency:
-                                m_in_flight = key_info.setdefault("model_in_flight", {}).get(normalized_model, 0)
-                                m_limit = DEFAULT_MODEL_CONCURRENCY.get(normalized_model, DEFAULT_FALLBACK_CONCURRENCY)
-                                if m_in_flight >= m_limit:
-                                    return None
                         key_info["req_count"] += 1
                         key_info["today_req_count"] = key_info.get("today_req_count", 0) + 1
                         key_info["last_used_at"] = now
@@ -623,18 +611,13 @@ class KeyManager:
 
                 if normalized_model:
                     m_quota = self._get_model_quota(key_info, normalized_model)
-                    if m_quota["success_today"] >= m_quota["limit_rpd"]:
+                    if m_quota["used_today"] >= m_quota["limit_rpd"]:
                         continue
                     if allow_transient_cooling:
                         if m_quota.get("cooldown_until", 0.0) > now + 15.0:
                             continue
                     elif m_quota.get("cooldown_until", 0.0) > now:
                         continue
-                    if check_concurrency:
-                        m_in_flight = key_info.setdefault("model_in_flight", {}).get(normalized_model, 0)
-                        m_limit = DEFAULT_MODEL_CONCURRENCY.get(normalized_model, DEFAULT_FALLBACK_CONCURRENCY)
-                        if m_in_flight >= m_limit:
-                            continue
 
                 key_info["req_count"] += 1
                 key_info["today_req_count"] = key_info.get("today_req_count", 0) + 1
@@ -653,24 +636,87 @@ class KeyManager:
 
             return None
 
+    def record_usage(
+        self,
+        key_str: str,
+        usage: dict | None = None,
+        model: str | None = None,
+        success: bool = True,
+    ) -> None:
+        """只更新 Token 曲线与全局计数。
+
+        P1 起请求路径的 in_flight 与模型级账本由 SlotRegistry 负责，
+        这里必须保持「不碰 in_flight、不碰 success_today」，否则会与结算重复计数。
+        """
+        with self._lock:
+            key_info = self._find_key(key_str)
+            if not key_info:
+                return
+            if success:
+                key_info["success_count"] += 1
+                key_info["today_success_count"] = key_info.get("today_success_count", 0) + 1
+                key_info["last_error"] = ""
+
+            tokens_delta = 0
+            if usage:
+                input_tokens = int(usage.get("promptTokenCount") or 0)
+                output_tokens = int(usage.get("candidatesTokenCount") or 0)
+                total_tokens = int(
+                    usage.get("totalTokenCount") or input_tokens + output_tokens
+                )
+                tokens_delta = total_tokens
+                key_info["input_tokens"] += input_tokens
+                key_info["output_tokens"] += output_tokens
+                key_info["thought_tokens"] += int(usage.get("thoughtsTokenCount") or 0)
+                key_info["total_tokens"] += total_tokens
+                key_info["cached_tokens"] += int(
+                    usage.get("cachedContentTokenCount") or 0
+                )
+                key_info["today_input_tokens"] = (
+                    key_info.get("today_input_tokens", 0) + input_tokens
+                )
+                key_info["today_output_tokens"] = (
+                    key_info.get("today_output_tokens", 0) + output_tokens
+                )
+                key_info["today_total_tokens"] = (
+                    key_info.get("today_total_tokens", 0) + total_tokens
+                )
+
+            now = self._clock()
+            if tokens_delta > 0:
+                dq = key_info.get("recent_tokens")
+                if not isinstance(dq, deque):
+                    dq = deque()
+                    key_info["recent_tokens"] = dq
+                dq.append((now, tokens_delta))
+                self._get_key_tpm(key_info, now)
+            if model and tokens_delta:
+                m_quota = self._get_model_quota(key_info, model)
+                m_quota["today_tokens"] = m_quota.get("today_tokens", 0) + tokens_delta
+            self._persist_state()
+
     def mark_success(
         self,
         key_str: str,
         usage: dict | None = None,
         model: str | None = None,
+        count_in_flight: bool = True,
     ):
         with self._lock:
             key_info = self._find_key(key_str)
             if not key_info:
                 return
-            if model:
-                norm_m = self._normalize_model(model)
-                key_info.setdefault("model_in_flight", {})[norm_m] = max(
-                    0, key_info.get("model_in_flight", {}).get(norm_m, 0) - 1
-                )
-                key_info["in_flight"] = sum(key_info.setdefault("model_in_flight", {}).values())
-            else:
-                key_info["in_flight"] = max(0, key_info.get("in_flight", 0) - 1)
+            if count_in_flight:
+                if model:
+                    norm_m = self._normalize_model(model)
+                    key_info.setdefault("model_in_flight", {})[norm_m] = max(
+                        0, key_info.get("model_in_flight", {}).get(norm_m, 0) - 1
+                    )
+                    key_info["in_flight"] = sum(
+                        key_info.setdefault("model_in_flight", {}).values()
+                    )
+                else:
+                    key_info["in_flight"] = max(0, key_info.get("in_flight", 0) - 1)
             key_info["success_count"] += 1
             key_info["today_success_count"] = key_info.get("today_success_count", 0) + 1
             key_info["last_error"] = ""
@@ -722,19 +768,23 @@ class KeyManager:
         disable: bool = False,
         rate_limited: bool = False,
         model: str | None = None,
+        count_in_flight: bool = True,
     ):
         with self._lock:
             key_info = self._find_key(key_str)
             if not key_info:
                 return
-            if model:
-                norm_m = self._normalize_model(model)
-                key_info.setdefault("model_in_flight", {})[norm_m] = max(
-                    0, key_info.get("model_in_flight", {}).get(norm_m, 0) - 1
-                )
-                key_info["in_flight"] = sum(key_info.setdefault("model_in_flight", {}).values())
-            else:
-                key_info["in_flight"] = max(0, key_info.get("in_flight", 0) - 1)
+            if count_in_flight:
+                if model:
+                    norm_m = self._normalize_model(model)
+                    key_info.setdefault("model_in_flight", {})[norm_m] = max(
+                        0, key_info.get("model_in_flight", {}).get(norm_m, 0) - 1
+                    )
+                    key_info["in_flight"] = sum(
+                        key_info.setdefault("model_in_flight", {}).values()
+                    )
+                else:
+                    key_info["in_flight"] = max(0, key_info.get("in_flight", 0) - 1)
             key_info["failure_count"] += 1
             key_info["today_failure_count"] = key_info.get("today_failure_count", 0) + 1
             key_info["last_error"] = reason[:240]
@@ -752,7 +802,7 @@ class KeyManager:
                         or "per day" in reason_lower
                         or ("quota" in reason_lower and "day" in reason_lower)
                     )
-                    is_daily_exhausted = has_daily_kw or (m_quota["success_today"] >= m_quota["limit_rpd"])
+                    is_daily_exhausted = has_daily_kw or (m_quota["used_today"] >= m_quota["limit_rpd"])
                     if is_daily_exhausted:
                         cd = max(cooldown_seconds, int(self._get_next_reset_epoch() - now))
                         logger.warning(
@@ -844,8 +894,11 @@ class KeyManager:
                 base_models = list(CANONICAL_MODELS.keys())
                 # 仅将今日有实际调用的额外冷门模型追加至扩展区，避免历史遗留脏模型破坏等高性
                 extra_models = [
-                    m for m in key_info.get("model_quotas", {}).keys()
-                    if m not in CANONICAL_MODELS and key_info["model_quotas"][m].get("success_today", 0) > 0
+                    m
+                    for m in key_info.get("model_quotas", {}).keys()
+                    if m not in CANONICAL_MODELS
+                    and m not in DEPRECATED_MODELS
+                    and key_info["model_quotas"][m].get("used_today", 0) > 0
                 ]
                 all_models = base_models + extra_models
 
@@ -863,7 +916,7 @@ class KeyManager:
                     q = self._get_model_quota(key_info, m)
                     limit_rpd = q.get("limit_rpd", DEFAULT_FALLBACK_RPD)
                     limit_tpd = q.get("limit_tpd", DEFAULT_FALLBACK_TPD)
-                    used_rpd = q.get("success_today", 0)
+                    used_rpd = q.get("used_today", 0)
                     used_tpd = q.get("today_tokens", 0)
                     remaining_rpd = max(0, limit_rpd - used_rpd)
                     is_cooling = q.get("cooldown_until", 0.0) > now
@@ -880,10 +933,6 @@ class KeyManager:
                     is_core = canon_meta.get("is_core", False)
                     category = canon_meta.get("category", "扩展模型")
                     m_in_flight = key_info.get("model_in_flight", {}).get(m, 0)
-                    m_limit = DEFAULT_MODEL_CONCURRENCY.get(m, DEFAULT_FALLBACK_CONCURRENCY)
-                    usage_ratio = round(used_rpd / limit_rpd, 3) if limit_rpd > 0 else 1.0
-                    is_deprioritized = usage_ratio > 0.6 and remaining_rpd > 0
-                    deprioritized_score = round(remaining_rpd * max(0.01, (1.0 - usage_ratio)), 3) if is_deprioritized else 0.0
 
                     m_map[m] = {
                         "limit_rpd": limit_rpd,
@@ -896,10 +945,6 @@ class KeyManager:
                         "category": category,
                         "cooldown_remaining_sec": max(0, int(q.get("cooldown_until", 0.0) - now)),
                         "in_flight": m_in_flight,
-                        "concurrency_limit": m_limit,
-                        "usage_ratio": usage_ratio,
-                        "is_deprioritized": is_deprioritized,
-                        "deprioritized_score": deprioritized_score,
                         "last_used_at": q.get("last_used_at", 0.0),
                     }
                     used_today_total += used_rpd
@@ -907,11 +952,7 @@ class KeyManager:
 
                 current_tpm, peak_tpm = self._get_key_tpm(key_info, now)
                 active_models = [
-                    {
-                        "model": m,
-                        "in_flight": count,
-                        "limit": DEFAULT_MODEL_CONCURRENCY.get(m, DEFAULT_FALLBACK_CONCURRENCY),
-                    }
+                    {"model": m, "in_flight": count}
                     for m, count in key_info.get("model_in_flight", {}).items()
                     if count > 0
                 ]
@@ -949,7 +990,6 @@ class KeyManager:
                         "models": m_map,
                         "used_today_total": used_today_total,
                         "limit_rpd_total": limit_rpd_total,
-                        "max_concurrency": sum(DEFAULT_MODEL_CONCURRENCY.values()),
                         "tpm_limit": 1000000,
                         "last_check_time": now,
                     }
@@ -994,12 +1034,17 @@ class KeyManager:
             for k in self.keys:
                 m_map = {}
                 all_models = sorted(
-                    set(list(DEFAULT_MODEL_RPD.keys()) + list(k.get("model_quotas", {}).keys()))
+                    {
+                        m
+                        for m in list(DEFAULT_MODEL_RPD.keys())
+                        + list(k.get("model_quotas", {}).keys())
+                        if m not in DEPRECATED_MODELS
+                    }
                 )
                 for m in all_models:
                     q = self._get_model_quota(k, m)
                     limit = q["limit_rpd"]
-                    used = q["success_today"]
+                    used = q["used_today"]
                     remaining = max(0, limit - used)
                     is_cooling = q["cooldown_until"] > now
                     status = (
@@ -1077,11 +1122,15 @@ class KeyManager:
                     key_info["recent_tokens"] = deque()
                 now = self._clock()
                 for m_name, m_quota in key_info.get("model_quotas", {}).items():
+                    # 旧状态只有 success_today（成功数），used_today（发出数）为 0。
+                    # 迁移时取两者较大值：宁可高估消耗，不可超卖。
+                    if int(m_quota.get("used_today", 0)) < int(m_quota.get("success_today", 0)):
+                        m_quota["used_today"] = int(m_quota.get("success_today", 0))
                     if m_quota.get("cooldown_until", 0.0) > now + 300:
                         remaining_cd = int(m_quota.get("cooldown_until", 0.0) - now)
                         logger.warning(
                             "Persistent cooldown detected: %s on %s has %ds remaining (used %d/%d). Preserved; use dashboard to unfreeze manually.",
-                            m_name, key_info["name"], remaining_cd, m_quota.get("success_today", 0), m_quota.get("limit_rpd", 20)
+                            m_name, key_info["name"], remaining_cd, m_quota.get("used_today", 0), m_quota.get("limit_rpd", 20)
                         )
         except (OSError, ValueError, TypeError) as exc:
             logger.warning("Unable to load Key pool state: %s", exc)

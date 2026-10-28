@@ -1,35 +1,14 @@
-import asyncio
-import hmac
 import json
-import logging
-import os
 import re
-import time
 import uuid
-import traceback
-from collections import deque
-from contextlib import asynccontextmanager
-from datetime import datetime
-from urllib.parse import unquote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
-from pydantic import BaseModel
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
-from app.core.key_manager import KeyManager, CANONICAL_MODELS
-from app.core.responses_adapter import (
-    chat_completion_to_response,
-    response_envelope,
-    responses_to_chat_request,
-    sse_event,
-)
 from app.core.thought_signatures import thought_signature_store
-from app.core.translator import openai_to_gemini, translate_tools
 from app.runtime import MAX_RETRY_AFTER_SECONDS, NATIVE_GEMINI_PATH_PATTERN, key_pool
+
 
 def retry_after_seconds(response: httpx.Response) -> int:
     header = response.headers.get("retry-after", "").strip()
@@ -62,10 +41,20 @@ def google_error_message(response: httpx.Response, body: bytes | None = None) ->
     return f"Google API returned HTTP {response.status_code}"
 
 
-def openai_error(message: str, status_code: int, error_type: str):
+def openai_error(
+    message: str,
+    status_code: int,
+    error_type: str,
+    headers: dict | None = None,
+    extra: dict | None = None,
+):
+    error = {"message": message, "type": error_type}
+    if extra:
+        error.update(extra)
     return JSONResponse(
         status_code=status_code,
-        content={"error": {"message": message, "type": error_type}},
+        content={"error": error},
+        headers=headers or {},
     )
 
 
@@ -143,14 +132,24 @@ def native_gemini_headers(request: Request, api_key: str) -> dict[str, str]:
     return headers
 
 
-def native_google_error(message: str, status_code: int = 503) -> JSONResponse:
+_NATIVE_STATUS = {400: "INVALID_ARGUMENT", 429: "RESOURCE_EXHAUSTED", 503: "UNAVAILABLE"}
+
+
+def native_google_error(
+    message: str,
+    status_code: int = 503,
+    headers: dict | None = None,
+    extra: dict | None = None,
+) -> JSONResponse:
+    error = {
+        "code": status_code,
+        "message": message,
+        "status": _NATIVE_STATUS.get(status_code, "UNKNOWN"),
+    }
+    if extra:
+        error.update(extra)
     return JSONResponse(
         status_code=status_code,
-        content={
-            "error": {
-                "code": status_code,
-                "message": message,
-                "status": "UNAVAILABLE" if status_code == 503 else "UNKNOWN",
-            }
-        },
+        content={"error": error},
+        headers=headers or {},
     )

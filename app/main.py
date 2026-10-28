@@ -1,11 +1,11 @@
 """装配层：只负责把 app 与各路由模块组装起来。
 
 业务实现分布：
-    runtime        进程级状态（app、Key 池、trace、鉴权、HTTP 客户端）
-    scheduling     http 参数解析与候选构造
+    runtime        进程级状态（app、Key 池、SlotRegistry、trace、鉴权、HTTP 客户端）
+    scheduling     路由契约解析、候选构造、令牌桶与账本
     producer       请求体构造
-    execution      错误分类与响应解析
-    consumer       settlement 与 retry 执行
+    execution      错误分类、响应解析、流式转发
+    consumer       候选推进、结算、非流式响应
     api            native / openai / admin 三组路由
 
 对外仍以 app.main 为入口，故在此重导出历史符号，避免调用方与测试改动。
@@ -16,13 +16,26 @@ from app.runtime import (  # noqa: F401
     app,
     key_pool,
     record_trace,
+    slot_registry,
 )
 from app.scheduling.policy import (  # noqa: F401
-    build_route_candidates,
+    DeadlineBelowFloor,
+    RouteSpec,
+    build_candidates,
     extract_fallback_models,
-    extract_route_mode,
+    extract_target_key,
     normalize_model,
+    parse_route_spec,
 )
+from app.scheduling.limits import (  # noqa: F401
+    ModelQuota,
+    SlotRegistry,
+    TimeoutProfile,
+    build_model_quota,
+    build_timeout_profiles,
+    rate_limit_mode,
+)
+from app.consumer.dispatch import run_candidates, slot_headers  # noqa: F401
 from app.producer.request_spec import build_generation_config  # noqa: F401
 from app.execution.classify import (  # noqa: F401
     extract_response_parts,

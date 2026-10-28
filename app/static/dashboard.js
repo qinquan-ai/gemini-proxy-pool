@@ -100,6 +100,48 @@ function renderKeyCards(data) {
   }
 }
 
+function renderModelQuotaStrip(data) {
+  const container = document.getElementById("model-quota-strip");
+  if (!container) return;
+  const items = (data.model_summary || []).filter((item) => item.primary);
+  container.replaceChildren();
+  if (!items.length) {
+    container.style.display = "none";
+    return;
+  }
+  container.style.display = "";
+  for (const item of items) {
+    const card = document.createElement("div");
+    card.className = `model-chip ${item.state || "available"}`;
+    card.title =
+      `${item.model}\n今日已用 ${item.used} / 上限 ${item.limit}\n` +
+      `可用 Key ${item.available_keys} 个，冷却 ${item.cooling_keys} 个\n` +
+      `在途 ${item.in_flight}，今日 429 ${item.rate_limited_today} 次，超时 ${item.timeout_today} 次`;
+
+    const head = document.createElement("div");
+    head.className = "model-chip-head";
+    const name = document.createElement("strong");
+    name.textContent = item.model.replace(/^gemini-/, "");
+    const left = document.createElement("span");
+    left.textContent = `剩 ${item.remaining}`;
+    head.append(name, left);
+
+    const meta = document.createElement("div");
+    meta.className = "model-chip-meta";
+    meta.textContent = `${item.used}/${item.limit} RPD · Key ${item.available_keys} 可用`;
+
+    const track = document.createElement("div");
+    track.className = "model-chip-track";
+    const fill = document.createElement("div");
+    fill.className = "model-chip-fill";
+    fill.style.width = `${item.limit > 0 ? Math.min(100, Math.round((item.used / item.limit) * 100)) : 0}%`;
+    track.append(fill);
+
+    card.append(head, meta, track);
+    container.append(card);
+  }
+}
+
 function renderChatPanel(data) {
   const chatPanel = document.getElementById("prompt-chat-panel");
   if (!chatPanel) return;
@@ -174,13 +216,13 @@ function renderTraces(data) {
     row.append(createCell(totalTok ? formatCompactNumber(totalTok) : "-", "numeric"));
 
     const modeMap = {
-      "01": "01: 并发竞速",
-      "11": "11: 定Key定模",
-      "10": "10: 模型降级",
-      "00": "00: 动态并发",
-      "Fail-Fast": "Fail-Fast",
+      single: "单模型",
+      family: "数组降级",
+      "lock-key": "锁 Key",
+      "lock-key+switch": "锁 Key + 数组",
+      "fail-fast": "Fail-Fast",
     };
-    const modeLabel = modeMap[trace.route_mode] || (trace.route_mode ? `模式 ${trace.route_mode}` : (trace.fail_fast ? "Fail-Fast" : "01: 并发竞速"));
+    const modeLabel = modeMap[trace.route_mode] || trace.route_mode || "-";
     row.append(createCell(modeLabel));
 
     const errorCell = createCell(trace.error || "正常", trace.error ? "error-text" : "success-text");
@@ -227,6 +269,7 @@ async function updateStats() {
       latestData = data;
 
       renderKeyCards(data);
+      renderModelQuotaStrip(data);
       renderChatPanel(data);
       renderTraces(data);
       renderIntegration(data);
@@ -246,7 +289,8 @@ async function updateStats() {
 
       const modelInfo = document.getElementById("model-info");
       if (modelInfo) {
-        modelInfo.textContent = `默认 ${data.default_model} · ${data.available_keys}/${data.total_keys} Key 可用 · ${data.auth_enabled ? "Token 鉴权" : "仅本机免密"}`;
+        const limitMode = { off: "限速关", shadow: "限速观察", enforce: "限速生效" }[data.rate_limit_mode] || data.rate_limit_mode;
+      modelInfo.textContent = `默认 ${data.default_model} · ${data.available_keys}/${data.total_keys} Key 可用 · ${limitMode} · ${data.auth_enabled ? "Token 鉴权" : "仅本机免密"}`;
       }
       const updatedAt = document.getElementById("updated-at");
       if (updatedAt) {

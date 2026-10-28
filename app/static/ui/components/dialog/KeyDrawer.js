@@ -206,6 +206,12 @@ export class KeyDrawer extends HTMLElement {
             used_tokens: mData.used_tokens_today,
             status: mData.status,
             cooldown: mData.cooldown_remaining_sec,
+            in_flight: mData.in_flight,
+            tokens: mData.tokens,
+            burst: mData.burst,
+            last_cost_ms: mData.last_cost_ms,
+            rate_limited: mData.rate_limited_today,
+            timeout: mData.timeout_today,
           }));
         }
       }

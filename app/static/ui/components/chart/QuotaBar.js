@@ -1,6 +1,5 @@
 /**
- * QuotaBar - 多模型日配额与官网每日支持 Token 数横向柱状图组件
- * 对应 TransFlow 的指标可视化组件
+ * QuotaBar - 单 Key 单模型的 RPD 进度。P1 起补充令牌桶状态与最近耗时。
  */
 export class QuotaBar extends HTMLElement {
   static get observedAttributes() {
@@ -13,8 +12,11 @@ export class QuotaBar extends HTMLElement {
       "status",
       "cooldown",
       "in-flight",
-      "concurrency-limit",
-      "is-deprioritized",
+      "tokens",
+      "burst",
+      "last-cost",
+      "rate-limited",
+      "timeout",
     ];
   }
 
@@ -44,8 +46,11 @@ export class QuotaBar extends HTMLElement {
     const status = (this.getAttribute("status") || "Active").toLowerCase();
     const cooldown = Number(this.getAttribute("cooldown") || 0);
     const inFlight = Number(this.getAttribute("in-flight") || 0);
-    const concurrencyLimit = Number(this.getAttribute("concurrency-limit") || 2);
-    const isDeprioritized = this.getAttribute("is-deprioritized") === "true";
+    const tokens = Number(this.getAttribute("tokens") || 0);
+    const burst = Number(this.getAttribute("burst") || 0);
+    const lastCost = Number(this.getAttribute("last-cost") || 0);
+    const rateLimited = Number(this.getAttribute("rate-limited") || 0);
+    const timeout = Number(this.getAttribute("timeout") || 0);
 
     const rpdPct = limitRpd > 0 ? Math.min(100, Math.round((usedRpd / limitRpd) * 100)) : 0;
     const tpdPct = limitTpd > 0 ? Math.min(100, Math.round((usedTokens / limitTpd) * 100)) : 0;
@@ -63,17 +68,17 @@ export class QuotaBar extends HTMLElement {
     if (inFlight > 0) {
       const flightTag = document.createElement("span");
       flightTag.className = "model-inflight-tag";
-      flightTag.innerHTML = `● 在途 [${inFlight}/${concurrencyLimit}]`;
-      flightTag.title = `当前模型正在并发: ${inFlight}，上限: ${concurrencyLimit}`;
+      flightTag.textContent = `在途 ${inFlight}`;
+      flightTag.title = `当前在飞请求数：${inFlight}。并发不是闸门，只作观测。`;
       titleEl.append(flightTag);
     }
 
-    if (isDeprioritized) {
-      const depTag = document.createElement("span");
-      depTag.className = "deprioritized-tag";
-      depTag.textContent = "后置 >60%";
-      depTag.title = "今日配额消耗已超 60%，在回复优先模式下排序后置";
-      titleEl.append(depTag);
+    if (burst > 0) {
+      const tokenTag = document.createElement("span");
+      tokenTag.className = "model-inflight-tag";
+      tokenTag.textContent = `令牌 ${tokens.toFixed(1)}/${burst}`;
+      tokenTag.title = "令牌桶余量。低于 1 时下一发需要等待补充。";
+      titleEl.append(tokenTag);
     }
 
     if (cooldown > 0) {
@@ -83,13 +88,23 @@ export class QuotaBar extends HTMLElement {
       titleEl.append(cdTag);
     }
 
+    if (lastCost > 0) {
+      const costTag = document.createElement("span");
+      costTag.className = "model-inflight-tag";
+      costTag.textContent = `上次 ${Math.round(lastCost)}ms`;
+      titleEl.append(costTag);
+    }
+
     const statEl = document.createElement("div");
     statEl.className = "quota-bar-stat";
-    
-    // 同时呈现 RPD 与官网每日支持 Token 上限 (TPD)
+
     const tpdText = limitTpd > 0 ? ` · Token ${this.formatCompact(usedTokens)}/${this.formatCompact(limitTpd)}` : "";
     statEl.textContent = `${usedRpd}/${limitRpd} RPD${tpdText} (${maxPct}%)`;
-    statEl.title = `请求进度: ${usedRpd} / ${limitRpd} RPD (${rpdPct}%)\n每日 Token 进度: ${usedTokens.toLocaleString()} / ${limitTpd.toLocaleString()} TPD (${tpdPct}%)`;
+    statEl.title =
+      `请求进度: ${usedRpd} / ${limitRpd} RPD (${rpdPct}%)\n` +
+      `每日 Token: ${usedTokens.toLocaleString()} / ${limitTpd.toLocaleString()} (${tpdPct}%)` +
+      (rateLimited ? `\n今日被上游 429：${rateLimited} 次` : "") +
+      (timeout ? `\n今日超时：${timeout} 次` : "");
 
     row.append(titleEl, statEl);
 
@@ -115,8 +130,11 @@ export function createQuotaBar({
   status,
   cooldown,
   in_flight,
-  concurrency_limit,
-  is_deprioritized,
+  tokens,
+  burst,
+  last_cost_ms,
+  rate_limited,
+  timeout,
 }) {
   const bar = document.createElement("quota-bar");
   bar.setAttribute("model", model);
@@ -127,7 +145,10 @@ export function createQuotaBar({
   bar.setAttribute("status", status || "Active");
   bar.setAttribute("cooldown", String(cooldown ?? 0));
   if (in_flight) bar.setAttribute("in-flight", String(in_flight));
-  if (concurrency_limit) bar.setAttribute("concurrency-limit", String(concurrency_limit));
-  if (is_deprioritized) bar.setAttribute("is-deprioritized", "true");
+  if (tokens !== undefined) bar.setAttribute("tokens", String(tokens));
+  if (burst) bar.setAttribute("burst", String(burst));
+  if (last_cost_ms) bar.setAttribute("last-cost", String(last_cost_ms));
+  if (rate_limited) bar.setAttribute("rate-limited", String(rate_limited));
+  if (timeout) bar.setAttribute("timeout", String(timeout));
   return bar;
 }

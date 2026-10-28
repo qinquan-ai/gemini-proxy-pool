@@ -1,37 +1,29 @@
 import asyncio
-import hmac
-import json
-import logging
 import os
-import re
 import time
 import uuid
-import traceback
-from collections import deque
-from contextlib import asynccontextmanager
-from datetime import datetime
-from urllib.parse import unquote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
+from fastapi import HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from app.core.key_manager import KeyManager, CANONICAL_MODELS
-from app.core.responses_adapter import (
-    chat_completion_to_response,
-    response_envelope,
-    responses_to_chat_request,
-    sse_event,
-)
-from app.core.thought_signatures import thought_signature_store
-from app.core.translator import openai_to_gemini, translate_tools
-from app.runtime import AVAILABLE_MODELS, DEFAULT_MODEL, PROXY_API_TOKEN, REQUEST_TRACES, STATIC_DIR, app, key_pool, logger, require_proxy_auth
+from app.core.key_manager import CANONICAL_MODELS, PRIMARY_MODELS
 from app.execution.classify import google_error_message
+from app.runtime import (
+    AVAILABLE_MODELS,
+    DEFAULT_MODEL,
+    PROXY_API_TOKEN,
+    REQUEST_TRACES,
+    STATIC_DIR,
+    app,
+    key_pool,
+    logger,
+    require_proxy_auth,
+    slot_registry,
+)
 from app.scheduling.policy import normalize_model
+
 
 @app.get("/", response_class=FileResponse)
 async def index():
@@ -86,24 +78,163 @@ async def list_models(request: Request):
     }
 
 
+def _decorate_pool(pool: list[dict]) -> None:
+    """把令牌桶快照补进每个 Key 的模型明细，面板只读这一份数据。"""
+    for key_data in pool:
+        key_info = key_pool.find_key_by_name(key_data["name"])
+        if not key_info:
+            continue
+        for model, detail in key_data.get("models", {}).items():
+            snap = slot_registry.snapshot(key_info, model)
+            detail.update(
+                {
+                    "tokens": snap["tokens"],
+                    "burst": snap["burst"],
+                    "rate": snap["rate"],
+                    "last_cost_ms": snap["last_cost_ms"],
+                    "rate_limited_today": snap["rate_limited_today"],
+                    "timeout_today": snap["timeout_today"],
+                }
+            )
+
+
+def _build_model_summary(pool: list[dict]) -> list[dict]:
+    """按模型聚合：顶部额度卡与 /v1/quota 共用。"""
+    summary: dict[str, dict] = {}
+    for key_data in pool:
+        for model, detail in key_data.get("models", {}).items():
+            item = summary.setdefault(
+                model,
+                {
+                    "model": model,
+                    "limit": 0,
+                    "used": 0,
+                    "remaining": 0,
+                    "in_flight": 0,
+                    "available_keys": 0,
+                    "cooling_keys": 0,
+                    "rate_limited_today": 0,
+                    "timeout_today": 0,
+                    "primary": model in PRIMARY_MODELS,
+                    "tier": CANONICAL_MODELS.get(model, {}).get("tier", ""),
+                },
+            )
+            item["limit"] += int(detail.get("limit_rpd", 0))
+            item["used"] += int(detail.get("used_today", 0))
+            item["remaining"] += int(detail.get("remaining", 0))
+            item["in_flight"] += int(detail.get("in_flight", 0))
+            item["rate_limited_today"] += int(detail.get("rate_limited_today", 0))
+            item["timeout_today"] += int(detail.get("timeout_today", 0))
+            if detail.get("status") == "Active":
+                item["available_keys"] += 1
+            elif detail.get("status") == "RateLimited":
+                item["cooling_keys"] += 1
+    for item in summary.values():
+        if item["remaining"] <= 0:
+            item["state"] = "exhausted"
+        elif item["available_keys"] == 0:
+            item["state"] = "cooling"
+        elif item["cooling_keys"] or item["available_keys"] < 3:
+            item["state"] = "partial"
+        else:
+            item["state"] = "available"
+    order = {m: i for i, m in enumerate(AVAILABLE_MODELS)}
+    return sorted(summary.values(), key=lambda x: order.get(x["model"], 999))
+
+
 @app.get("/v1/status")
 async def get_status():
     status = key_pool.get_status()
     quota_status = key_pool.get_quota_status()
+    _decorate_pool(status["pool"])
+    status["model_summary"] = _build_model_summary(status["pool"])
     status["default_model"] = DEFAULT_MODEL
     status["models"] = AVAILABLE_MODELS
     status["auth_enabled"] = bool(PROXY_API_TOKEN)
     status["quota_summary"] = quota_status.get("summary_by_model", {})
     status["quota_reset_in_hours"] = quota_status.get("next_reset_in_hours")
+    status["rate_limit_mode"] = slot_registry.mode
+    status["slot_stats"] = slot_registry.stats()
     status["recent_traces"] = list(REQUEST_TRACES)[:30]
     status["total_traces"] = len(REQUEST_TRACES)
     return JSONResponse(content=status)
 
 
+@app.get("/v1/timing")
+async def get_timing(model: str | None = None):
+    """上游调用耗时统计（每 Key × 模型的最近样本分位数）。额度请用 /v1/quota。"""
+    if not model:
+        return JSONResponse(content={"model": None, "per_key": []})
+
+    normalized = normalize_model(model, strict=False) or model
+    per_key = []
+    for key_info in key_pool.keys:
+        snap = slot_registry.snapshot(key_info, normalized)
+        recent = snap.get("recent_cost_ms") or []
+        if not recent:
+            continue
+        ordered = sorted(recent)
+        last = len(ordered) - 1
+        per_key.append(
+            {
+                "name": key_info["name"],
+                "count": len(ordered),
+                "last_ms": snap.get("last_cost_ms", 0),
+                "p50_ms": ordered[len(ordered) // 2],
+                "p95_ms": ordered[min(last, int(len(ordered) * 0.95))],
+                "max_ms": ordered[last],
+            }
+        )
+    return JSONResponse(content={"model": normalized, "per_key": per_key})
+
+
 @app.get("/v1/quota")
-async def get_quota():
-    """获取模型配额状态摘要"""
-    return JSONResponse(content=key_pool.get_quota_status())
+async def get_quota(model: str | None = None):
+    """模型配额摘要。带 model 参数时返回该模型的逐 Key 明细。"""
+    base = key_pool.get_quota_status()
+    base["rate_limit_mode"] = slot_registry.mode
+    base["slot_stats"] = slot_registry.stats()
+    base["reset_in_s"] = base.get("seconds_to_next_reset", 0)
+
+    if not model:
+        return JSONResponse(content=base)
+
+    normalized = normalize_model(model, strict=False) or model
+    per_key = []
+    for key_info in key_pool.keys:
+        snap = slot_registry.snapshot(key_info, normalized)
+        per_key.append(
+            {
+                "name": key_info["name"],
+                "used": snap["used_today"],
+                "limit": snap["limit_rpd"],
+                "remaining": snap["remaining"],
+                "cooling_s": snap["cooldown_remaining_sec"],
+                "in_flight": snap["in_flight"],
+                "tokens": snap["tokens"],
+                "burst": snap["burst"],
+                "rate": snap["rate"],
+                # 前端面板仍在读该字段（KeyCard/QuotaBar/KeyDrawer）；
+                # 完整的耗时统计（p50/p95）请看 /v1/timing
+                "last_cost_ms": snap["last_cost_ms"],
+                "rate_limited_today": snap["rate_limited_today"],
+                "timeout_today": snap["timeout_today"],
+                "disabled": bool(key_info.get("disabled")),
+            }
+        )
+    base.update(
+        {
+            "model": normalized,
+            "rpd_limit": sum(item["limit"] for item in per_key),
+            "rpd_used": sum(item["used"] for item in per_key),
+            "remaining": sum(item["remaining"] for item in per_key),
+            "available_keys": sum(
+                1 for item in per_key if item["remaining"] > 0 and item["cooling_s"] == 0
+            ),
+            "per_key": per_key,
+        }
+    )
+    return JSONResponse(content=base)
 
 
 @app.get("/v1/traces")
@@ -159,7 +290,7 @@ async def ping_key(key_name: str, request: Request):
                 for m_name in CANONICAL_MODELS:
                     q = key_pool._get_model_quota(key_info, m_name)
                     limit_rpd = q.get("limit_rpd", 20)
-                    used_today = q.get("success_today", 0)
+                    used_today = q.get("used_today", 0)
                     ratio = (used_today / limit_rpd) if limit_rpd > 0 else 0.0
                     is_deprioritized = ratio > 0.6 and (limit_rpd - used_today) > 0
                     can_use, reason = key_pool.can_consume(key_info, m_name, check_concurrency=False, now=now_ts)

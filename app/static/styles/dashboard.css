@@ -1611,3 +1611,67 @@ verification-modal.is-open {
   to { transform: rotate(360deg); }
 }
 
+
+/* ---------- 模型额度条（P1）：按模型聚合，只显示当前值 ---------- */
+.model-quota-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 0.6rem;
+  margin-bottom: 0.9rem;
+}
+
+.model-chip {
+  border: 1px solid var(--border, rgba(120, 120, 140, 0.18));
+  border-radius: 10px;
+  padding: 0.55rem 0.7rem;
+  background: var(--surface-2, rgba(120, 120, 140, 0.04));
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 0;
+}
+
+.model-chip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.model-chip-head strong {
+  font-size: 0.78rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.model-chip-head span {
+  font-size: 0.72rem;
+  color: var(--text-muted, #71717a);
+  white-space: nowrap;
+}
+
+.model-chip-meta {
+  font-size: 0.7rem;
+  color: var(--text-muted, #71717a);
+}
+
+.model-chip-track {
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(120, 120, 140, 0.16);
+  overflow: hidden;
+}
+
+.model-chip-fill {
+  height: 100%;
+  width: 0;
+  background: #6366f1;
+  transition: width 0.3s ease;
+}
+
+.model-chip.partial .model-chip-fill { background: #d97706; }
+.model-chip.cooling .model-chip-fill { background: #0ea5e9; }
+.model-chip.exhausted .model-chip-fill { background: #dc2626; }
+.model-chip.exhausted { opacity: 0.75; }

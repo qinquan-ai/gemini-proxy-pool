@@ -161,8 +161,11 @@ export class KeyCard extends HTMLElement {
             status: mData.status,
             cooldown: mData.cooldown_remaining_sec,
             in_flight: mData.in_flight,
-            concurrency_limit: mData.concurrency_limit,
-            is_deprioritized: mData.is_deprioritized,
+            tokens: mData.tokens,
+            burst: mData.burst,
+            last_cost_ms: mData.last_cost_ms,
+            rate_limited: mData.rate_limited_today,
+            timeout: mData.timeout_today,
           })
         );
       }
@@ -202,8 +205,11 @@ export class KeyCard extends HTMLElement {
               status: mData.status,
               cooldown: mData.cooldown_remaining_sec,
               in_flight: mData.in_flight,
-              concurrency_limit: mData.concurrency_limit,
-              is_deprioritized: mData.is_deprioritized,
+              tokens: mData.tokens,
+              burst: mData.burst,
+              last_cost_ms: mData.last_cost_ms,
+              rate_limited: mData.rate_limited_today,
+              timeout: mData.timeout_today,
             })
           );
         }

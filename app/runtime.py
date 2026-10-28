@@ -1,34 +1,21 @@
-import asyncio
 import hmac
-import json
 import logging
 import os
 import re
 import time
 import uuid
-import traceback
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
-from urllib.parse import unquote
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
-from pydantic import BaseModel
 
-from app.core.key_manager import KeyManager, CANONICAL_MODELS
-from app.core.responses_adapter import (
-    chat_completion_to_response,
-    response_envelope,
-    responses_to_chat_request,
-    sse_event,
-)
-from app.core.thought_signatures import thought_signature_store
-from app.core.translator import openai_to_gemini, translate_tools
+from app.core.key_manager import KeyManager
+from app.scheduling.limits import SlotRegistry
 
 load_dotenv()
 
@@ -197,6 +184,9 @@ app.add_middleware(
 key_pool = KeyManager()
 
 
+slot_registry = SlotRegistry(key_pool)
+
+
 def require_proxy_auth(request: Request):
     if not PROXY_API_TOKEN:
         return
@@ -208,13 +198,5 @@ def require_proxy_auth(request: Request):
         raise HTTPException(status_code=401, detail="Invalid proxy token")
 
 
-MODE_11_TIMEOUT_SECONDS = float(os.getenv("MODE_11_TIMEOUT_SECONDS", "300"))
-
-
-HEDGE_TIMEOUT_SECONDS = float(os.getenv("HEDGE_TIMEOUT_SECONDS", "120"))
-
-
-HEDGE_INTERVAL_SECONDS = float(os.getenv("HEDGE_INTERVAL_SECONDS", "3.0"))
-
-
-MAX_HEDGED_CONCURRENCY = int(os.getenv("MAX_HEDGED_CONCURRENCY", "3"))
+# 每次请求的预算由 RouteSpec.timeout_s 决定（超时三档见 scheduling/quota.py），
+# 这里只保留 httpx 客户端的兜底值。

@@ -1,34 +1,7 @@
-import asyncio
-import hmac
-import json
-import logging
-import os
-import re
-import time
-import uuid
-import traceback
-from collections import deque
-from contextlib import asynccontextmanager
-from datetime import datetime
-from urllib.parse import unquote
+from fastapi import HTTPException
 
-import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
-from pydantic import BaseModel
-
-from app.core.key_manager import KeyManager, CANONICAL_MODELS
-from app.core.responses_adapter import (
-    chat_completion_to_response,
-    response_envelope,
-    responses_to_chat_request,
-    sse_event,
-)
-from app.core.thought_signatures import thought_signature_store
 from app.core.translator import openai_to_gemini, translate_tools
+
 
 def build_generation_config(openai_request: dict) -> dict:
     mapping = {

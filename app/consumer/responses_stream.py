@@ -1,49 +1,22 @@
-import asyncio
-import hmac
 import json
-import logging
-import os
-import re
-import time
 import uuid
-import traceback
-from collections import deque
-from contextlib import asynccontextmanager
-from datetime import datetime
-from urllib.parse import unquote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
-from pydantic import BaseModel
 
-from app.core.key_manager import KeyManager, CANONICAL_MODELS
-from app.core.responses_adapter import (
-    chat_completion_to_response,
-    response_envelope,
-    responses_to_chat_request,
-    sse_event,
-)
-from app.core.thought_signatures import thought_signature_store
-from app.core.translator import openai_to_gemini, translate_tools
+from app.core.responses_adapter import response_envelope, sse_event
 from app.execution.streaming import stream_with_retry
+
 
 async def responses_stream_with_retry(
     client: httpx.AsyncClient,
-    base_url: str,
     payload: dict,
-    model: str,
+    spec,
     response_id: str,
     created_at: int,
     response_request: dict,
-    target_key: str | None = None,
-    request: Request | None = None,
-    route_mode: str = "01",
-    custom_fallbacks: list[str] | None = None,
+    chat_id: str,
 ):
+    model = spec.model
     sequence = 0
     initial_response = response_envelope(
         response_id,
@@ -61,20 +34,8 @@ async def responses_stream_with_retry(
     message_item = None
     text_chunks = []
     function_items = []
-    chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-    async for chunk in stream_with_retry(
-        client,
-        base_url,
-        payload,
-        model,
-        chat_id,
-        created_at,
-        target_key=target_key,
-        request=request,
-        route_mode=route_mode,
-        custom_fallbacks=custom_fallbacks,
-    ):
+    async for chunk in stream_with_retry(client, payload, spec, chat_id, created_at):
         for line in chunk.splitlines():
             if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
