@@ -171,10 +171,13 @@ def cmd_recommend(args):
 
 
 def cmd_snapshot(args):
-    from app.core.studio_inspector import StudioInspector, DEFAULT_AI_STUDIO_URL, DEFAULT_PROFILE
+    from app.core.studio_inspector import StudioInspector, DEFAULT_PROFILE
+
     inspector = StudioInspector(
         profile_name=args.profile or DEFAULT_PROFILE,
-        target_url=args.url or DEFAULT_AI_STUDIO_URL,
+        # 不传则内部按 STUDIO_AI_URL / STUDIO_AI_PROJECT_ID 解析
+        target_url=args.url,
+        account=getattr(args, "account", ""),
     )
     saved_img = inspector.capture_snapshot(
         output_path=args.output,
@@ -182,6 +185,17 @@ def cmd_snapshot(args):
         headless=getattr(args, "headless", False),
     )
     print(f"[*] Snapshot ready for quota calibration: {saved_img}")
+
+
+def cmd_login(args):
+    """打开浏览器登录指定账号（每个账号首次用 level 2 之前跑一次）。"""
+    from app.core.studio_inspector import DEFAULT_PROFILE, StudioInspector
+
+    inspector = StudioInspector(
+        profile_name=DEFAULT_PROFILE,
+        account=args.account,
+    )
+    inspector.open_for_login(timeout_s=args.wait)
 
 
 def main():
@@ -192,10 +206,16 @@ def main():
     p_quota.add_argument("--level", "-l", type=int, choices=[1, 2], default=1, help="Inspection level: 1=Memory/JSON counter (<50ms, default), 2=Live Playwright browser snapshot & DOM audit (~8s)")
     p_quota.add_argument("--headless", action="store_true", help="For Level 2: run headless without opening visible Chrome window")
     p_quota.add_argument("--profile", default="0", help="For Level 2: Chrome profile index (0, 1), default: 0")
+    p_quota.add_argument("--account", "-a", default="", help="For Level 2: 账号名（初号机/子号1/子号2），决定独立的 Chrome 数据目录 data/studio_profiles/<账号>/")
     p_quota.add_argument("--url", help="For Level 2: AI Studio rate limit URL")
-    p_quota.add_argument("--wait", type=int, default=8, help="For Level 2: Wait seconds for charts to render")
+    p_quota.add_argument("--wait", type=int, default=30, help="For Level 2: 等待页面渲染的上限秒数（轮询关键元素，命中即继续），默认 30")
     p_quota.add_argument("--output", "-o", help="For Level 2: Custom output image file path")
     p_quota.set_defaults(func=cmd_quota)
+
+    p_login = subparsers.add_parser("login", help="Level 2 前置：为指定账号登录 Google（每账号首次一次）")
+    p_login.add_argument("--account", "-a", required=True, help="账号标识：1=qin / 2=edis / 3=sheron（也接受名字）")
+    p_login.add_argument("--wait", type=int, default=600, help="最长等待登录秒数，默认 600")
+    p_login.set_defaults(func=cmd_login)
 
     p_history = subparsers.add_parser("history", help="Display 30-day quota history")
     p_history.set_defaults(func=cmd_history)

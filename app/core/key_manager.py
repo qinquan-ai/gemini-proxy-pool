@@ -225,12 +225,30 @@ class KeyManager:
 
         keys_str = os.getenv("GEMINI_KEYS", "") if keys_value is None else keys_value
         if keys_str:
-            for item in keys_str.split(","):
+            # 支持两种分隔：换行与逗号；支持两种标识：“account_id|key” 与旧的 “名称|key”
+            import re as _re
+
+            from app.core.accounts import load_accounts as _load_accounts
+
+            _accounts = _load_accounts()
+            for item in _re.split(r"[\n,]+", keys_str.replace("\\n", "\n")):
+                item = item.strip()
                 if "|" not in item:
                     continue
-                name, key = item.split("|", 1)
-                if key.strip():
-                    self._add_key(name.strip() or "Unnamed", key.strip())
+                ident, key = item.split("|", 1)
+                ident, key = ident.strip(), key.strip()
+                if not key:
+                    continue
+                # 只接受 account_id 作为标识（旧的「名称|key」已废弃）
+                if not ident.isdigit():
+                    logging.getLogger(__name__).warning(
+                        "GEMINI_KEYS 条目标识不是 account_id，已忽略：%r（格式应为 <account_id>|<api_key>）",
+                        ident,
+                    )
+                    continue
+                acc_id = int(ident)
+                name = _accounts.get(acc_id, {}).get("name") or f"account-{acc_id}"
+                self._add_key(name, key, account_id=acc_id)
         elif keys_value is None:
             single_key = os.getenv("GEMINI_API_KEY", "").strip()
             if single_key:
@@ -238,11 +256,12 @@ class KeyManager:
         self._load_state()
         self._check_and_reset_daily()
 
-    def _add_key(self, name: str, key: str):
+    def _add_key(self, name: str, key: str, account_id: int = 0):
         self.keys.append(
             {
                 "name": name,
                 "key": key,
+                "account_id": account_id,
                 "req_count": 0,
                 "success_count": 0,
                 "failure_count": 0,

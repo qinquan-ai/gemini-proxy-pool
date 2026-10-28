@@ -8,40 +8,109 @@ import os
 import sys
 import time
 import json
+import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from playwright.sync_api import sync_playwright
 
-DEFAULT_AI_STUDIO_URL = "https://aistudio.google.com/rate-limit?timeRange=last-1-day&project=gen-lang-client-0386075480"
+DEFAULT_PROJECT_ID = "gen-lang-client-0386075480"
+DEFAULT_AI_STUDIO_URL_TEMPLATE = (
+    "https://aistudio.google.com/rate-limit?timeRange=last-1-day&project={project_id}"
+)
 DEFAULT_PROFILE = "Default"
-CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-STUDIO_PROFILE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "studio_chrome_profile"
+PROFILE_ROOT = Path(__file__).resolve().parent.parent.parent / "data" / "studio_profiles"
+LEGACY_PROFILE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "studio_chrome_profile"
 SNAPSHOTS_DIR = Path(__file__).resolve().parent.parent.parent / "logs" / "snapshots"
 
 
+def _env(name: str, default: str = "") -> str:
+    return (os.environ.get(name) or "").strip() or default
+
+
+def resolve_ai_studio_url(account: str = "") -> str:
+    """STUDIO_AI_URL 优先；其次 STUDIO_AI_PROJECT_ID；最后按账号自动取 project_id。
+
+    account 可以是 account_id（"2"）、名字（"edis"）或邮箱，
+    这样查任意账号额度都不用再手拼 URL。
+    """
+    explicit = _env("STUDIO_AI_URL")
+    if explicit:
+        return explicit
+
+    project = _env("STUDIO_AI_PROJECT_ID")
+    if not project and account:
+        try:
+            from app.core.accounts import project_for_ident
+
+            project = project_for_ident(account)
+        except Exception:
+            project = ""
+
+    return DEFAULT_AI_STUDIO_URL_TEMPLATE.format(
+        project_id=project or DEFAULT_PROJECT_ID
+    )
+
+
+def resolve_cdp_port() -> int:
+    """Chrome 远程调试端口，被占用时用 STUDIO_CDP_PORT 改。"""
+    raw = _env("STUDIO_CDP_PORT")
+    try:
+        return int(raw) if raw else 9222
+    except ValueError:
+        return 9222
+
+
 def find_system_chrome() -> str:
+    """按 STUDIO_CHROME_PATH → 常见安装位置探测；都找不到直接报错。
+
+    不再返回一个不存在的路径——那会让 Playwright 抛一个很难懂的启动错误。
+    """
+    env_path = _env("STUDIO_CHROME_PATH")
+    if env_path:
+        if os.path.isfile(env_path):
+            return env_path
+        raise FileNotFoundError(f"STUDIO_CHROME_PATH 指向的文件不存在: {env_path}")
+
     candidates = [
-        CHROME_PATH,
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe"),
     ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return CHROME_PATH
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "未找到 Google Chrome，请设置环境变量 STUDIO_CHROME_PATH 指向 chrome.exe"
+    )
+
+
+def resolve_profile_dir(account: str = "") -> Path:
+    """每个账号一份独立 Chrome 数据目录：data/studio_profiles/<account>/。
+
+    三个 Key 分属三个独立 Google 账号，Cookie 不通用，必须各自一份 profile。
+    未指定账号时回落到旧目录（data/studio_chrome_profile），保证初号机已有登录态不断。
+    """
+    name = (account or _env("STUDIO_ACCOUNT", "default")).strip() or "default"
+    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in name)
+    target = PROFILE_ROOT / safe
+    if safe == "default" and not target.exists() and LEGACY_PROFILE_DIR.is_dir():
+        return LEGACY_PROFILE_DIR
+    return target
 
 
 class StudioInspector:
     def __init__(
         self,
         profile_name: str | int = DEFAULT_PROFILE,
-        target_url: str = DEFAULT_AI_STUDIO_URL,
-        port: int = 9222,
+        target_url: Optional[str] = None,
+        port: Optional[int] = None,
+        account: str = "",
     ):
         self.profile_name = str(profile_name)
-        self.target_url = target_url
-        self.port = port
-        self.profile_dir = STUDIO_PROFILE_DIR
+        self.target_url = target_url or resolve_ai_studio_url(account)
+        self.port = port or resolve_cdp_port()
+        self.profile_dir = resolve_profile_dir(account)
+        self.account = (account or "").strip()
 
     def _ensure_all_models_toggle(self, page) -> None:
         """Ensure 'All models' toggle is checked without accidentally toggling it off."""
@@ -268,7 +337,80 @@ class StudioInspector:
         time.sleep(0.5)
         return str(final_path.resolve())
 
-    def capture_snapshot(self, output_path: Optional[str] = None, wait_seconds: int = 8, headless: bool = False) -> str:
+    def open_for_login(self, timeout_s: int = 600) -> None:
+        """用**系统 Chrome 直接打开**登录页（不经 Playwright）。
+
+        为什么必须绕开 Playwright：它的 persistent context 带自动化特征，
+        Google 登录页会弹 reCAPTCHA 且勾选框无法选（“请验证您并非自动程序”）。
+        原生 Chrome 没有任何标记，验证码正常可过；登录完成后 Cookie 落在同一个
+        profile 目录，后续 capture_snapshot 仍可用 Playwright 复用。
+        """
+        chrome_exe = find_system_chrome()
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[*] 账号标识: {self.account or 'default'}")
+        print(f"[*] Profile : {self.profile_dir}")
+        print("[*] 正在用系统 Chrome 打开登录页（原生模式，无自动化特征）...")
+        print("[*] 登录完成后请关闭该 Chrome 窗口，登录态会自动保存。")
+
+        cmd = [
+            chrome_exe,
+            f"--user-data-dir={self.profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "https://accounts.google.com",
+        ]
+        try:
+            proc = subprocess.Popen(cmd)
+        except Exception as exc:
+            raise RuntimeError(f"启动 Chrome 失败: {exc}") from exc
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            time.sleep(1)
+
+        if proc.poll() is None:
+            print("[!] 等待超时，请手动关闭 Chrome 窗口")
+        else:
+            print("[OK] Chrome 已关闭，登录态已写入 Profile")
+
+    def _wait_for_quota_ready(self, page, timeout_s: float = 30.0) -> bool:
+        """轮询等待额度页真正渲染完成（代替固定 sleep）。
+
+        就绪信号（任一命中）：
+          1. 'All models' 开关组件出现
+          2. 表格行数 > 3（模型列表已渲染）
+        网络快时 1~2 秒就返回，慢时自动多等，比写死 8 秒可靠。
+        """
+        deadline = time.time() + max(5.0, float(timeout_s))
+        last_state = ""
+        while time.time() < deadline:
+            try:
+                state = page.evaluate(
+                    """() => {
+                        const toggle = document.querySelector('mat-slide-toggle');
+                        const rows = document.querySelectorAll('table tbody tr, mat-row, [role="row"]');
+                        return { toggle: !!toggle, rows: rows.length };
+                    }"""
+                )
+            except Exception:
+                time.sleep(0.5)
+                continue
+
+            rows = int(state.get("rows") or 0)
+            if state.get("toggle") or rows > 3:
+                print(f"[*] 页面已就绪（开关={state.get('toggle')}，表格行={rows}）")
+                return True
+
+            detail = f"toggle={state.get('toggle')} rows={rows}"
+            if detail != last_state:
+                print(f"  [.] 等待渲染中... ({detail})")
+                last_state = detail
+            time.sleep(0.5)
+        return False
+
+    def capture_snapshot(self, output_path: Optional[str] = None, wait_seconds: int = 30, headless: bool = False) -> str:
         """
         Launches Chrome with independent persistent profile (data/studio_chrome_profile),
         verifies 'All models' toggle, extracts 40+ model metrics via DOM,
@@ -360,8 +502,9 @@ class StudioInspector:
                     return ""
 
             print(f"[*] 页面标题: 《{page.title()}》")
-            print(f"[*] 等待 {wait_seconds} 秒以供速率与配额指标完成初次渲染...")
-            time.sleep(wait_seconds)
+            print(f"[*] 等待额度表格渲染（最多 {wait_seconds} 秒，命中关键元素即继续）...")
+            if not self._wait_for_quota_ready(page, timeout_s=wait_seconds):
+                print(f"  [!] {wait_seconds}s 内未检测到表格行，尝试继续提取；网络慢可加大 --wait")
 
             # Step 1: Ensure 'All models' toggle is ON (without toggling off)
             self._ensure_all_models_toggle(page)
